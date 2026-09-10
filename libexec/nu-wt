@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# summary: git worktrees — create, list, clean up
+set -euo pipefail
+. "${NU_LIB:?nu-wt must be run through the nu dispatcher}/common.sh"
+
+REPO_NAME=
+
+usage() {
+  cat <<'USAGE'
+usage: nu wt <subcommand> [args]
+
+  add <branch>     create (or reuse) a worktree for <branch> and cd into it
+                     -b, --base <ref>  branch off <ref> (default: origin/<default>)
+                     --fetch           fetch --prune first
+                     --no-cd           do not move the shell
+                     --no-hook         skip the repo's post-add hook
+  list             list this repo's worktrees
+                     --size            measure disk usage (slow)
+  clean            report removable worktrees and offer to delete them
+                     verdicts: merged (in the default branch) | gone (upstream
+                     branch deleted, i.e. squash-merged MR) | orphan (directory
+                     git does not know about) | keep (do not touch)
+                     -n, --dry-run     report only
+                     -y, --yes         remove everything removable without asking
+                     --no-fetch        skip the fetch --prune (less accurate)
+                     --no-size         skip disk usage measurement
+                     --force           force removal of worktrees git refuses to drop
+                     --delete-branches also delete the local branch of what it removes
+  cd <query>       cd into the worktree whose name matches <query>
+  rm <query>       remove the worktree whose name matches <query>
+                     --force           remove even with local changes
+
+every subcommand takes --repo <name> to act on a repo you are not standing in
+(known: registered automatically the first time you use nu wt inside a repo)
+USAGE
+}
+
+# Sets the global MAIN. Deliberately not a command-substitution helper: a die()
+# two substitutions deep only kills its own subshell, and the caller sails on.
+resolve_main() {
+  if [ -n "$REPO_NAME" ]; then
+    MAIN=$(lookup_repo "$REPO_NAME")
+  else
+    MAIN=$(main_worktree)
+  fi
+  [ -n "$MAIN" ] || die "could not resolve the repository"
+  register_repo "$MAIN"
+}
+
+# Fills the globals STATE_VERDICT and STATE_REASON from the branch alone,
+# ignoring the state of the working tree.
+branch_state() {
+  local wt="$1" branch="$2" main="$3" default_ref="$4"
+  local remote= merge= upstream= ahead=0 outside=0
+
+  outside=$(git -C "$wt" rev-list --count "$default_ref..HEAD" 2>/dev/null || echo 0)
+
+  if git -C "$wt" merge-base --is-ancestor HEAD "$default_ref" 2>/dev/null; then
+    STATE_VERDICT=merged STATE_REASON="merged into ${default_ref#origin/}"
+    return
+  fi
+
+  # Read the upstream from config rather than @{u}: once the remote branch is
+  # deleted @{u} no longer resolves, and that is exactly the case we care about.
+  remote=$(git -C "$wt" config --get "branch.$branch.remote" 2>/dev/null || echo "")
+  merge=$(git -C "$wt" config --get "branch.$branch.merge" 2>/dev/null || echo "")
+  [ -n "$remote" ] && [ -n "$merge" ] && upstream="$remote/${merge#refs/heads/}"
+
+  if [ -z "$upstream" ]; then
+    if [ "$outside" -eq 0 ]; then
+      STATE_VERDICT=merged STATE_REASON="no commits of its own"
+    else
+      STATE_VERDICT=keep STATE_REASON="$outside commit(s), never pushed"
+    fi
+    return
+  fi
+
+  if ! git -C "$main" rev-parse --verify --quiet "refs/remotes/$upstream" > /dev/null 2>&1; then
+    STATE_VERDICT=gone
+    STATE_REASON="$upstream deleted upstream (squash-merged MR?), $outside commit(s) not in ${default_ref#origin/}"
+    return
+  fi
+
+  ahead=$(git -C "$wt" rev-list --count "$upstream..HEAD" 2>/dev/null || echo 0)
+  if [ "$ahead" -gt 0 ]; then
+    STATE_VERDICT=keep STATE_REASON="$ahead commit(s) not pushed to $upstream"
+  else
+    STATE_VERDICT=keep STATE_REASON="pushed, not merged ($outside commit(s) ahead)"
+  fi
+}
+
+# Fills the globals VERDICT and REASON for one registered worktree.
+# Verdicts merged / gone / orphan / prunable are removable, keep is not.
+classify_worktree() {
+  local wt="$1" branch="$2" main="$3" default_ref="$4"
+  local counts modified untracked
+
+  if [ ! -d "$wt" ]; then
+    VERDICT=prunable REASON="directory no longer exists"
+    return
+  fi
+  if [ -z "$branch" ]; then
+    VERDICT=keep REASON="detached HEAD"
+    return
+  fi
+
+  counts=$(git -C "$wt" status --porcelain | awk '
+    /^\?\?/ { u++ } !/^\?\?/ { m++ } END { print (m + 0) " " (u + 0) }
+  ')
+  modified=${counts% *}
+  untracked=${counts#* }
+
+  branch_state "$wt" "$branch" "$main" "$default_ref"
+
+  if [ "$modified" -gt 0 ]; then
+    VERDICT=keep REASON="$modified uncommitted file(s) — $STATE_REASON"
+  elif [ "$untracked" -gt 0 ]; then
+    VERDICT=keep REASON="$untracked untracked file(s), nowhere else — $STATE_REASON"
+  else
+    VERDICT=$STATE_VERDICT REASON=$STATE_REASON
+  fi
+}
+
+# One tab-separated record per candidate: path, label, verdict, reason, sizeKB
+collect_worktrees() {
+  local main="$1" wtroot="$2" with_size="$3" default_ref
+  default_ref="origin/$(default_branch "$main")"
+  git -C "$main" rev-parse --verify --quiet "refs/remotes/$default_ref" > /dev/null 2>&1 \
+    || default_ref="$(default_branch "$main")"
+
+  local path branch size
+  while IFS=$'\t' read -r path branch; do
+    [ "$path" = "$main" ] && continue
+    classify_worktree "$path" "$branch" "$main" "$default_ref"
+    size=0
+    if [ "$with_size" = 1 ] && [ -d "$path" ]; then
+      size=$(du -sk "$path" 2>/dev/null | awk '{ print $1 }')
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$path" "${branch:-(detached)}" "$VERDICT" "$REASON" "${size:-0}"
+  done < <(git -C "$main" worktree list --porcelain | awk '
+    /^worktree /  { if (p != "") { print p "\t" b }; p = substr($0, 10); b = "" }
+    /^branch /    { b = substr($0, 8); sub(/^refs\/heads\//, "", b) }
+    END           { if (p != "") print p "\t" b }
+  ')
+
+  # Directories left behind in the worktrees root that git knows nothing about.
+  [ -d "$wtroot" ] || return 0
+  local dir
+  for dir in "$wtroot"/*; do
+    [ -d "$dir" ] || continue
+    git -C "$main" worktree list --porcelain | grep -qxF "worktree $dir" && continue
+    size=0
+    if [ "$with_size" = 1 ]; then
+      size=$(du -sk "$dir" 2>/dev/null | awk '{ print $1 }')
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$dir" "-" "orphan" "not a registered worktree" "${size:-0}"
+  done
+}
+
+verdict_color() {
+  case "$1" in
+    merged | prunable) printf '%s' "$C_GREEN" ;;
+    gone | orphan) printf '%s' "$C_YELLOW" ;;
+    *) printf '%s' "$C_DIM" ;;
+  esac
+}
+
+wt_add() {
+  local branch= base= fetch=0 do_cd=1 run_hook=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -b | --base) base=${2:?--base needs a ref}; shift 2 ;;
+      --repo) REPO_NAME=${2:?--repo needs a name}; shift 2 ;;
+      --fetch) fetch=1; shift ;;
+      --no-cd) do_cd=0; shift ;;
+      --no-hook) run_hook=0; shift ;;
+      -h | --help) usage; exit 0 ;;
+      -*) die "unknown flag '$1'" ;;
+      *)
+        [ -z "$branch" ] || die "unexpected argument '$1'"
+        branch=$1
+        shift
+        ;;
+    esac
+  done
+  [ -n "$branch" ] || die "usage: nu wt add <branch>"
+
+  local main wtroot path existing
+  resolve_main
+  main=$MAIN
+  wtroot=$(worktrees_root "$main")
+  path="$wtroot/$(branch_to_dirname "$branch")"
+
+  [ "$fetch" = 1 ] && { step "fetching"; git -C "$main" fetch --prune --quiet origin; }
+
+  existing=$(worktree_path_for_branch "$main" "$branch")
+  if [ -n "$existing" ]; then
+    step "$branch is already checked out"
+    [ "$do_cd" = 1 ] && request_cd "$existing"
+    return 0
+  fi
+
+  if [ -e "$path" ]; then
+    die "$path exists but is not a worktree for $branch — 'nu wt clean' will offer to remove it"
+  fi
+
+  mkdir -p "$wtroot"
+  if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+    step "checking out existing branch $branch"
+    git -C "$main" worktree add "$path" "$branch"
+  elif git -C "$main" rev-parse --verify --quiet "refs/remotes/origin/$branch" > /dev/null 2>&1; then
+    step "tracking origin/$branch"
+    git -C "$main" worktree add --track -b "$branch" "$path" "origin/$branch"
+  else
+    if [ -z "$base" ]; then
+      base="origin/$(default_branch "$main")"
+      git -C "$main" rev-parse --verify --quiet "refs/remotes/$base" > /dev/null 2>&1 \
+        || base=$(default_branch "$main")
+    fi
+    step "creating $branch from $base"
+    git -C "$main" worktree add --no-track -b "$branch" "$path" "$base"
+  fi
+
+  local hook="$NU_HOOKS/$(basename "$main")/post-add"
+  if [ "$run_hook" = 1 ] && [ -x "$hook" ]; then
+    step "running hook $hook"
+    (cd "$path" && NU_WT_PATH="$path" NU_WT_BRANCH="$branch" NU_WT_MAIN="$main" "$hook")
+  fi
+
+  [ "$do_cd" = 1 ] && request_cd "$path"
+  return 0
+}
+
+wt_list() {
+  local with_size=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) REPO_NAME=${2:?--repo needs a name}; shift 2 ;;
+      --size) with_size=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) die "unknown argument '$1'" ;;
+    esac
+  done
+
+  local main wtroot records path branch verdict reason size
+  resolve_main
+  main=$MAIN
+  wtroot=$(worktrees_root "$main")
+  printf '%s%s%s  %s\n' "$C_BOLD" "$(basename "$main")" "$C_RESET" "$(dim "$wtroot")"
+  records=$(collect_worktrees "$main" "$wtroot" "$with_size")
+  [ -n "$records" ] || { dim "  no worktrees"; return 0; }
+
+  while IFS=$'\t' read -r path branch verdict reason size; do
+    if [ "$with_size" = 1 ]; then
+      printf '  %s%-6s%s %-7s %s\n' "$(verdict_color "$verdict")" "$(human_size "$size")" "$C_RESET" "$verdict" "$(basename "$path")"
+    else
+      printf '  %s%-7s%s %s\n' "$(verdict_color "$verdict")" "$verdict" "$C_RESET" "$(basename "$path")"
+    fi
+    printf '          %s\n' "$(dim "$reason")"
+  done <<< "$records"
+}
+
+remove_worktree() {
+  local main="$1" path="$2" verdict="$3" force="$4"
+  case "$path" in
+    */*.worktrees/?*) ;;
+    *) die "refusing to remove '$path': not inside a .worktrees directory" ;;
+  esac
+
+  if [ "$verdict" = prunable ]; then
+    git -C "$main" worktree prune
+    return 0
+  fi
+  if [ "$verdict" = orphan ]; then
+    rm -rf "$path"
+    return 0
+  fi
+  if [ "$force" = 1 ]; then
+    git -C "$main" worktree remove --force "$path"
+  else
+    git -C "$main" worktree remove "$path"
+  fi
+}
+
+wt_clean() {
+  local dry_run=0 assume_yes=0 fetch=1 with_size=1 force=0 del_branches=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) REPO_NAME=${2:?--repo needs a name}; shift 2 ;;
+      -n | --dry-run) dry_run=1; shift ;;
+      -y | --yes) assume_yes=1; shift ;;
+      --no-fetch) fetch=0; shift ;;
+      --no-size) with_size=0; shift ;;
+      --force) force=1; shift ;;
+      --delete-branches) del_branches=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) die "unknown argument '$1'" ;;
+    esac
+  done
+
+  local main wtroot records path branch verdict reason size
+  resolve_main
+  main=$MAIN
+  wtroot=$(worktrees_root "$main")
+
+  [ "$fetch" = 1 ] && { step "fetching origin (--no-fetch to skip)"; git -C "$main" fetch --prune --quiet origin; }
+  git -C "$main" worktree prune
+
+  step "$(basename "$main") — $wtroot"
+  records=$(collect_worktrees "$main" "$wtroot" "$with_size")
+  [ -n "$records" ] || { dim "nothing to clean"; return 0; }
+
+  local candidates="" reclaim=0 kept=0
+  while IFS=$'\t' read -r path branch verdict reason size; do
+    printf '  %s%-7s%s %-7s %s\n' "$(verdict_color "$verdict")" "$verdict" "$C_RESET" \
+      "$([ "$with_size" = 1 ] && human_size "$size" || printf '%s' '-')" "$(basename "$path")"
+    printf '          %s\n' "$(dim "$reason")"
+    if [ "$verdict" = keep ]; then
+      kept=$((kept + 1))
+    else
+      candidates="$candidates$path"$'\t'"$verdict"$'\t'"$size"$'\t'"$branch"$'\n'
+      reclaim=$((reclaim + size))
+    fi
+  done <<< "$records"
+
+  if [ -z "$candidates" ]; then
+    dim "nothing removable ($kept kept)"
+    return 0
+  fi
+
+  printf '\n'
+  step "$(printf '%s' "$candidates" | grep -c .) removable, $kept kept$([ "$with_size" = 1 ] && printf ', %s to reclaim' "$(human_size "$reclaim")")"
+  [ "$dry_run" = 1 ] && { dim "dry run — nothing removed"; return 0; }
+
+  if [ "$assume_yes" = 1 ]; then
+    NU_ASSUME_YES=1
+  elif [ ! -t 0 ]; then
+    warn "no terminal to ask on — re-run with -y to remove without prompting"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r path verdict size branch; do
+    [ -n "$path" ] || continue
+    confirm "remove $(basename "$path")?" || continue
+    if ! remove_worktree "$main" "$path" "$verdict" "$force"; then
+      warn "could not remove $path — retry with --force if you are sure"
+      continue
+    fi
+    printf '  %sremoved%s %s\n' "$C_GREEN" "$C_RESET" "$(basename "$path")"
+    if [ "$del_branches" = 1 ] && [ -n "$branch" ] && [ "$branch" != "-" ]; then
+      if git -C "$main" branch -D "$branch" > /dev/null 2>&1; then
+        printf '  %sdeleted branch%s %s\n' "$C_GREEN" "$C_RESET" "$branch"
+      else
+        warn "kept branch $branch (git refused to delete it)"
+      fi
+    fi
+  done <<< "$candidates"
+
+  git -C "$main" worktree prune
+}
+
+match_worktrees() {
+  local main="$1" query="$2"
+  git -C "$main" worktree list --porcelain | sed -n 's/^worktree //p' | grep -v "^$main$" \
+    | grep -i -- "$query" || :
+}
+
+wt_cd() {
+  local query=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) REPO_NAME=${2:?--repo needs a name}; shift 2 ;;
+      -h | --help) usage; exit 0 ;;
+      *) query=$1; shift ;;
+    esac
+  done
+  [ -n "$query" ] || die "usage: nu wt cd <query>"
+
+  local main matches count
+  resolve_main
+  main=$MAIN
+  matches=$(match_worktrees "$main" "$query")
+  count=$(printf '%s' "$matches" | grep -c . || :)
+
+  [ "$count" -eq 0 ] && die "no worktree matches '$query'"
+  if [ "$count" -eq 1 ]; then
+    request_cd "$matches"
+    return 0
+  fi
+
+  local i=1 path reply
+  while IFS= read -r path; do
+    printf '  %2d) %s\n' "$i" "$(basename "$path")" >&2
+    i=$((i + 1))
+  done <<< "$matches"
+  printf 'which? [1-%d] ' "$count" >&2
+  read -r reply || die "aborted"
+  case "$reply" in '' | *[!0-9]*) die "aborted" ;; esac
+  [ "$reply" -ge 1 ] && [ "$reply" -le "$count" ] || die "out of range"
+  request_cd "$(printf '%s\n' "$matches" | sed -n "${reply}p")"
+}
+
+wt_rm() {
+  local query= force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) REPO_NAME=${2:?--repo needs a name}; shift 2 ;;
+      --force) force=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) query=$1; shift ;;
+    esac
+  done
+  [ -n "$query" ] || die "usage: nu wt rm <query>"
+
+  local main matches count
+  resolve_main
+  main=$MAIN
+  matches=$(match_worktrees "$main" "$query")
+  count=$(printf '%s' "$matches" | grep -c . || :)
+  [ "$count" -eq 0 ] && die "no worktree matches '$query'"
+  [ "$count" -eq 1 ] || die "'$query' matches $count worktrees — be more specific"
+
+  local status
+  status=$(git -C "$matches" status --porcelain 2>/dev/null || :)
+  [ -n "$status" ] && warn "$(basename "$matches") has uncommitted changes"
+  confirm "remove $(basename "$matches")?" || { dim "aborted"; return 0; }
+  remove_worktree "$main" "$matches" registered "$force"
+  printf '  %sremoved%s %s\n' "$C_GREEN" "$C_RESET" "$(basename "$matches")"
+}
+
+sub=${1:-list}
+[ $# -gt 0 ] && shift
+case "$sub" in
+  add | a) wt_add "$@" ;;
+  list | ls) wt_list "$@" ;;
+  clean | prune) wt_clean "$@" ;;
+  cd) wt_cd "$@" ;;
+  rm | remove) wt_rm "$@" ;;
+  -h | --help | help) usage ;;
+  *) die "unknown subcommand '$sub' (try: nu wt --help)" ;;
+esac

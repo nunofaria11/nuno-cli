@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Copy this to hooks/<repo-directory-name>/post-add and chmod +x to have
+# `nu wt add` run it inside every new worktree of that repo.
+#
+#   hooks/flip/post-add        -> runs for /Users/nuno/code/flipnext/flip
+#   hooks/mobile-app/post-add  -> runs for /Users/nuno/code/flipnext/mobile-app
+#
+# cwd is the new worktree. Available: NU_WT_PATH, NU_WT_BRANCH, NU_WT_MAIN.
+set -euo pipefail
+
+# Untracked local config that a fresh worktree would otherwise be missing:
+for f in .claude/settings.local.json api/intellij-http/http-client.private.env.json; do
+  if [ -f "$NU_WT_MAIN/$f" ] && [ ! -f "$f" ]; then
+    mkdir -p "$(dirname "$f")"
+    cp "$NU_WT_MAIN/$f" "$f"
+    echo "copied $f"
+  fi
+done

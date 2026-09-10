@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# nu — personal command dispatcher. Subcommands live in libexec/nu-<name>.
+set -euo pipefail
+
+resolve_self() {
+  local target="$1" dir
+  while [ -L "$target" ]; do
+    dir=$(cd -P "$(dirname "$target")" && pwd)
+    target=$(readlink "$target")
+    case "$target" in
+      /*) ;;
+      *) target="$dir/$target" ;;
+    esac
+  done
+  printf '%s\n' "$(cd -P "$(dirname "$target")" && pwd)/$(basename "$target")"
+}
+
+NU_SELF=$(resolve_self "$0")
+NU_ROOT=$(dirname "$(dirname "$NU_SELF")")
+NU_LIBEXEC="$NU_ROOT/libexec"
+NU_LIB="$NU_ROOT/lib"
+NU_HOOKS="$NU_ROOT/hooks"
+export NU_ROOT NU_LIBEXEC NU_LIB NU_HOOKS
+
+usage() {
+  cat <<USAGE
+${C_BOLD:-}nu${C_RESET:-} — personal commands
+
+usage: nu <command> [args]
+
+commands:
+USAGE
+  local file name summary
+  for file in "$NU_LIBEXEC"/nu-*; do
+    [ -f "$file" ] || continue
+    name=$(basename "$file")
+    name=${name#nu-}
+    summary=$(sed -n 's/^# summary: //p' "$file" | head -1)
+    printf '  %-10s %s\n' "$name" "$summary"
+  done
+  cat <<'USAGE'
+
+  help       this text
+
+run `nu <command> --help` for a command's own options
+USAGE
+}
+
+cmd=${1:-help}
+case "$cmd" in
+  help | --help | -h | "") usage; exit 0 ;;
+esac
+shift
+
+target="$NU_LIBEXEC/nu-$cmd"
+if [ ! -f "$target" ]; then
+  printf 'nu: unknown command '\''%s'\''\n\n' "$cmd" >&2
+  usage >&2
+  exit 1
+fi
+
+exec "$target" "$@"
