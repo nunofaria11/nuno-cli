@@ -1,3 +1,7 @@
+# Resolved at source time so completion can enumerate libexec/ instead of
+# hardcoding a command list that goes stale the moment you add one.
+NU_ROOT_DIR=${0:A:h:h}
+
 # Wrapper around bin/nu. A subprocess cannot chdir its parent shell, so nu
 # writes the directory it wants us to enter into $NU_CD_FILE and we obey.
 nu() {
@@ -22,11 +26,19 @@ _nu_worktree_names() {
     | sed -n 's/^worktree //p' | grep -v "^${main}$" | xargs -n1 basename 2>/dev/null
 }
 
+_nu_commands() {
+  local file
+  for file in $NU_ROOT_DIR/libexec/nu-*(N); do
+    print -r -- ${${file:t}#nu-}
+  done
+  print -r -- help
+}
+
 _nu() {
   local -a subcommands
   subcommands=(add list clean cd rm)
   if (( CURRENT == 2 )); then
-    compadd help wt
+    compadd -- ${(f)"$(_nu_commands)"}
     return
   fi
   [[ $words[2] == wt ]] || return
