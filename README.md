@@ -95,6 +95,66 @@ worktree unless you pass `-y`. `orphan` directories are deleted with `rm -rf`,
 which is why removal refuses any path that is not inside a `*.worktrees/`
 directory.
 
+## nu rebase — stacked branches
+
+Splitting one big MR into a stack means every review round on an early branch
+leaves the branches above it sitting on a tip that no longer exists. `nu rebase`
+replays the whole stack in one pass and resolves the conflicts that have exactly
+one sane answer.
+
+```sh
+nu rebase                     # plan, confirm, rebase the stack above the rewritten branch
+nu rebase -y                  # no question
+nu rebase -n                  # plan and take backups, rebase nothing
+nu rebase b1 b2 b3            # explicit order, bottom first
+nu rebase --base origin/master  # restack onto an advanced base
+nu rebase verify              # range-diff every rewritten branch against its backup
+nu rebase abort               # abort and restore every branch
+nu rebase cleanup             # drop the backup refs and the run's state
+```
+
+The chain is inferred from the current branch. A parent that was amended is no
+longer an ancestor of the branches above it, so candidates are anchored on the
+newest tip they had that the stack tip still contains — which is what makes the
+`git rebase --onto <new-parent> <old-tip> <stack-tip> --update-refs` arguments
+correct, and one rebase enough for the whole stack.
+
+### What it resolves without asking
+
+| class | how | reported |
+|---|---|---|
+| conflict seen before | `rerere`, enabled per invocation | as a cache hit, worth a glance |
+| lockfiles | private merge driver takes the branch's side | yes, they owe a dependency re-resolve |
+| disjoint line edits | line-granular three-way merge | yes, with the reason |
+| generated files | same merge; one side if it clashes or exceeds 20k lines | yes, they owe a regeneration |
+
+Generated paths are whatever the repo's own `.gitattributes` marks with an
+attribute containing `generated`, so the classification stays the repo's
+business. `git` conflicts whole hunks, which is why an import inserted next to a
+renamed one collides even though the two edits touch different lines; that case
+is the bulk of a stacked rebase and it merges cleanly here.
+
+Anything else stops the run with exit `10` and prints the conflict **narrowed to
+the lines that actually clash** — the disjoint edits around them are already
+applied. Resolve, `git add`, and run `nu rebase` again to continue; mid-rebase it
+resumes without asking. `/rebase` in Claude Code or omp drives the same engine
+when you would rather have an agent make those calls.
+
+Backups go to `refs/stack-backup/<branch>`, invisible to `git branch`. Nothing in
+the repository config, `.gitattributes` or `.git/info` is touched: every git
+behaviour change is passed per invocation with `git -c` against a private
+attributes file, so a crashed run leaves nothing to undo.
+
+An optional `.stack-rebase.json` at the repo root tunes it:
+
+```json
+{
+  "takeTheirs": ["api/spec/v4/development/*.yaml"],
+  "askAlways": ["**/db/migration/**"],
+  "regen": { "api/spec/**": "make -C api build" }
+}
+```
+
 ## Hooks
 
 `hooks/<repo-directory-name>/post-add`, if executable, runs inside each new
@@ -107,6 +167,7 @@ bootstrap. See `hooks/example.post-add`.
 bin/nu                 dispatcher
 libexec/nu-<command>    one file per command; `# summary:` shows up in `nu help`
 lib/common.sh           colours, prompts, cd requests, repo resolution
+lib/stack_rebase.py     the stacked-rebase engine behind nu rebase
 shell/nu.zsh            nu() wrapper, wt alias, completion
 hooks/                  per-repo post-add hooks
 ```

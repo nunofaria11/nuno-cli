@@ -34,21 +34,32 @@ _nu_commands() {
   print -r -- help
 }
 
+_nu_branches() {
+  git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
+}
+
 _nu() {
-  local -a subcommands
-  subcommands=(add list clean cd rm)
   if (( CURRENT == 2 )); then
     compadd -- ${(f)"$(_nu_commands)"}
     return
   fi
-  [[ $words[2] == wt ]] || return
-  if (( CURRENT == 3 )); then
-    compadd -- $subcommands
-    return
-  fi
-  case $words[3] in
-    add) compadd -- ${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin 2>/dev/null | sed 's|^origin/||' | sort -u)"} ;;
-    cd|rm) compadd -- ${(f)"$(_nu_worktree_names)"} ;;
+  case $words[2] in
+    wt)
+      if (( CURRENT == 3 )); then
+        compadd -- add list clean cd rm
+        return
+      fi
+      case $words[3] in
+        add) compadd -- ${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin 2>/dev/null | sed 's|^origin/||' | sort -u)"} ;;
+        cd|rm) compadd -- ${(f)"$(_nu_worktree_names)"} ;;
+      esac
+      ;;
+    rebase)
+      # Subcommands only in third position; branch names anywhere after it.
+      (( CURRENT == 3 )) && compadd -- plan report verify abort cleanup
+      compadd -- -y --yes -n --dry-run --base --tip --old-tip
+      compadd -- ${(f)"$(_nu_branches)"}
+      ;;
   esac
 }
 

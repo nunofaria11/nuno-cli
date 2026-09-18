@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# summary: rebase a stack of dependent branches, resolving what is mechanical
+set -euo pipefail
+. "${NU_LIB:?nu-rebase must be run through the nu dispatcher}/common.sh"
+
+ENGINE="$NU_LIB/stack_rebase.py"
+
+usage() {
+  cat <<'USAGE'
+usage: nu rebase [branch ...] [options]
+       nu rebase <subcommand>
+
+Replays a stack of dependent branches onto a rewritten parent in one pass, and
+resolves every conflict that has exactly one sane answer: resolutions recorded
+by rerere, lockfiles, generated files, and edits that touch disjoint lines.
+Anything that needs a judgement call stops the run.
+
+Branches are given bottom-first; with none, the chain is inferred from the
+current branch (a rewritten parent is found through its reflog).
+
+  -y, --yes          do not ask before rewriting
+  -n, --dry-run      show the plan and take backups, rebase nothing
+  --base <branch>    branch the stack forks from (default: origin HEAD)
+  --tip <branch>     top of the stack when inferring (default: current branch)
+  --old-tip <sha>    pre-rewrite tip of the diverged parent, when the reflog
+                     reading looks wrong
+
+subcommands:
+  plan               print the chain and the exact rebase, change nothing
+  report             re-print the conflicts of a paused run
+  verify             range-diff every rewritten branch against its backup
+  abort              abort the rebase and restore every branch from backup
+  cleanup            drop the backup refs and the run's state
+
+Backups live in refs/stack-backup/<branch>, invisible to `git branch`. Nothing
+in the repository config or working tree is modified.
+USAGE
+}
+
+sub=run
+assume_yes=${NU_ASSUME_YES:-0}
+dry=0
+args=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    plan | report | verify | abort | cleanup) sub="$1" ;;
+    run) sub=run ;;
+    -y | --yes) assume_yes=1 ;;
+    -n | --dry-run) dry=1 ;;
+    --base | --tip | --old-tip)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      args+=("$1" "$2")
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*) die "unknown option '$1' (nu rebase --help)" ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+
+command -v python3 >/dev/null || die "python3 not found"
+[ -f "$ENGINE" ] || die "engine missing: $ENGINE"
+
+engine() { python3 "$ENGINE" "$@"; }
+
+# Exit 10 is the engine asking for a decision, not a failure. Say what to do
+# about it and pass the code on, so scripts and the agent can both branch on it.
+paused_footer() {
+  printf '\n'
+  step "stopped for a decision"
+  dim "resolve the files above, git add them, then: nu rebase${args[0]+ ${args[*]}}"
+  dim "or hand it to an agent: /rebase${args[0]+ ${args[*]}}"
+}
+
+case "$sub" in
+  plan) exec python3 "$ENGINE" plan ${args[0]+"${args[@]}"} ;;
+  report | verify | abort | cleanup)
+    set +e
+    engine "$sub" ${args[0]+"${args[@]}"}
+    rc=$?
+    set -e
+    [ "$rc" = 10 ] && [ "$sub" = report ] && paused_footer
+    exit "$rc"
+    ;;
+esac
+
+if [ "$dry" = 1 ]; then
+  exec python3 "$ENGINE" run --dry-run ${args[0]+"${args[@]}"}
+fi
+
+# Mid-rebase HEAD is detached, so there is no chain to plan and nothing left to
+# confirm: the run just resumes where it stopped.
+rebase_in_progress() {
+  local dir
+  for dir in rebase-merge rebase-apply; do
+    dir=$(git rev-parse --git-path "$dir" 2>/dev/null) || return 1
+    [ -d "$dir" ] && return 0
+  done
+  return 1
+}
+
+rebase_in_progress && assume_yes=1
+
+quiet=()
+if [ "$assume_yes" != 1 ]; then
+  plan_out=$(engine plan ${args[0]+"${args[@]}"})
+  printf '%s\n' "$plan_out"
+  case "$plan_out" in
+    *"nothing to do"*) exit 0 ;;
+  esac
+  printf '\n'
+  confirm "rewrite these branches?" || die "aborted"
+  printf '\n'
+  # The plan is already on screen; do not print it twice.
+  quiet=(--quiet)
+fi
+
+set +e
+engine run ${quiet[0]+"${quiet[@]}"} ${args[0]+"${args[@]}"}
+rc=$?
+set -e
+[ "$rc" = 10 ] && paused_footer
+exit "$rc"
