@@ -54,7 +54,7 @@ _nu() {
         cd|rm) compadd -- ${(f)"$(_nu_worktree_names)"} ;;
       esac
       ;;
-    rebase)
+    rb)
       # Subcommands only in third position; branch names anywhere after it.
       (( CURRENT == 3 )) && compadd -- plan report verify abort cleanup
       compadd -- -y --yes -n --dry-run --base --tip --old-tip

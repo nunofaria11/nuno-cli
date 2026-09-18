@@ -6,7 +6,7 @@ pages explain the reasoning behind them.
 | command | what it does | docs |
 |---|---|---|
 | `nu wt` | git worktrees — create, list, clean up | [wt/](wt/) |
-| `nu rebase` | rebase a stack of dependent branches, resolving what is mechanical | [rebase/](rebase/) |
+| `nu rb` | rebase a stack of dependent branches, resolving what is mechanical | [rb/](rb/) |
 
 `nu help` lists whatever is in `libexec/` right now, which is the authoritative
 answer to "what commands exist". Installation and development notes are in the

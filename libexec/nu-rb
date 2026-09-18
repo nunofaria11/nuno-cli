@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # summary: rebase a stack of dependent branches, resolving what is mechanical
 set -euo pipefail
-. "${NU_LIB:?nu-rebase must be run through the nu dispatcher}/common.sh"
+. "${NU_LIB:?nu-rb must be run through the nu dispatcher}/common.sh"
 
 ENGINE="$NU_LIB/stack_rebase.py"
 
 usage() {
   cat <<'USAGE'
-usage: nu rebase [branch ...] [options]
-       nu rebase <subcommand>
+usage: nu rb [branch ...] [options]
+       nu rb <subcommand>
 
 Replays a stack of dependent branches onto a rewritten parent in one pass, and
 resolves every conflict that has exactly one sane answer: resolutions recorded
@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
       usage
       exit 0
       ;;
-    -*) die "unknown option '$1' (nu rebase --help)" ;;
+    -*) die "unknown option '$1' (nu rb --help)" ;;
     *) args+=("$1") ;;
   esac
   shift
@@ -73,7 +73,7 @@ engine() { python3 "$ENGINE" "$@"; }
 paused_footer() {
   printf '\n'
   step "stopped for a decision"
-  dim "resolve the files above, git add them, then: nu rebase${args[0]+ ${args[*]}}"
+  dim "resolve the files above, git add them, then: nu rb${args[0]+ ${args[*]}}"
   dim "or hand it to an agent: /rebase${args[0]+ ${args[*]}}"
 }
 

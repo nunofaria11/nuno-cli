@@ -7,7 +7,7 @@ to register and nothing to build.
 | command | docs |
 |---|---|
 | `nu wt` — git worktrees: create, list, clean up | [docs/wt/](docs/wt/) |
-| `nu rebase` — rebase a stack of dependent branches | [docs/rebase/](docs/rebase/) |
+| `nu rb` — rebase a stack of dependent branches | [docs/rb/](docs/rb/) |
 
 What each command does lives in [`docs/`](docs/). This file is about installing
 the thing and working on it.
@@ -60,7 +60,7 @@ command worth explaining gets a `docs/<command>/` directory.
 bin/nu                  dispatcher
 libexec/nu-<command>    one file per command; `# summary:` shows up in `nu help`
 lib/common.sh           colours, prompts, cd requests, repo resolution
-lib/stack_rebase.py     the stacked-rebase engine behind nu rebase
+lib/stack_rebase.py     the stacked-rebase engine behind nu rb
 shell/nu.zsh            nu() wrapper, wt alias, completion
 hooks/                  per-repo post-add hooks
 docs/<command>/         one directory per command

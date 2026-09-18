@@ -1,19 +1,19 @@
-# nu rebase — stacked branches
+# nu rb — stacked branches
 
 Splitting one big MR into a stack means every review round on an early branch
-leaves the branches above it sitting on a tip that no longer exists. `nu rebase`
+leaves the branches above it sitting on a tip that no longer exists. `nu rb`
 replays the whole stack in one pass and resolves the conflicts that have exactly
 one sane answer.
 
 ```sh
-nu rebase                     # plan, confirm, rebase the stack above the rewritten branch
-nu rebase -y                  # no question
-nu rebase -n                  # plan and take backups, rebase nothing
-nu rebase b1 b2 b3            # explicit order, bottom first
-nu rebase --base origin/master  # restack onto an advanced base
-nu rebase verify              # range-diff every rewritten branch against its backup
-nu rebase abort               # abort and restore every branch
-nu rebase cleanup             # drop the backup refs and the run's state
+nu rb                     # plan, confirm, rebase the stack above the rewritten branch
+nu rb -y                  # no question
+nu rb -n                  # plan and take backups, rebase nothing
+nu rb b1 b2 b3            # explicit order, bottom first
+nu rb --base origin/master  # restack onto an advanced base
+nu rb verify              # range-diff every rewritten branch against its backup
+nu rb abort               # abort and restore every branch
+nu rb cleanup             # drop the backup refs and the run's state
 ```
 
 The chain is inferred from the current branch. A parent that was amended is no
@@ -41,8 +41,8 @@ is the bulk of a stacked rebase and it merges cleanly here.
 
 Anything else stops the run with exit `10` and prints the conflict **narrowed to
 the lines that actually clash** — the disjoint edits around them are already
-applied. Resolve, `git add`, and run `nu rebase` again to continue; mid-rebase it
-resumes without asking. `nu rebase report` re-prints the conflicts of a paused
+applied. Resolve, `git add`, and run `nu rb` again to continue; mid-rebase it
+resumes without asking. `nu rb report` re-prints the conflicts of a paused
 run. `/rebase` in Claude Code or omp drives the same engine when you would
 rather have an agent make those calls.
 
@@ -56,7 +56,7 @@ the repository config, `.gitattributes` or `.git/info` is touched: every git
 behaviour change is passed per invocation with `git -c` against a private
 attributes file, so a crashed run leaves nothing to undo.
 
-`nu rebase verify` range-diffs every rewritten branch against its backup — the
+`nu rb verify` range-diffs every rewritten branch against its backup — the
 check that the replay changed nothing but the base. `abort` restores every
 branch from backup; `cleanup` drops the backup refs and the run's state once you
 are happy.
