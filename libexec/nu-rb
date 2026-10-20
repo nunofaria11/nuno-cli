@@ -16,7 +16,8 @@ by rerere, lockfiles, generated files, and edits that touch disjoint lines.
 Anything that needs a judgement call stops the run.
 
 Branches are given bottom-first; with none, the chain is inferred from the
-current branch (a rewritten parent is found through its reflog).
+current branch (a rewritten parent is found through its reflog). Branches at the
+bottom that were squash-merged into the base are dropped from the stack.
 
   -y, --yes          do not ask before rewriting
   -n, --dry-run      show the plan and take backups, rebase nothing

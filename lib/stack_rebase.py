@@ -252,6 +252,24 @@ def reflog_anchor(g: Git, ref: str, descendant: str) -> str | None:
     return None
 
 
+def squash_merged(g: Git, branch: str, base: str, since: str) -> bool:
+    """True when `branch`'s change since `since` already sits in `base` as a single commit."""
+    tree = g.sha(f"{branch}^{{tree}}")
+    if not since or tree == g.sha(f"{since}^{{tree}}"):
+        return False
+    # A dangling commit carrying the branch as one patch, so `git cherry` can
+    # match it against the squash commit by patch-id.
+    probe = g.out("commit-tree", tree, "-p", since, "-m", "stack-rebase squash probe")
+    return bool(probe) and g.out("cherry", base, probe, since).startswith("-")
+
+
+def merged_anchor(g: Git, merged: list[dict], child: str) -> tuple[int, str, str] | None:
+    """The squash-merged tip `child` was built on, as (commits replayed, sha, source)."""
+    cands = [(g.count(f"{m['sha']}..{child}"), m["sha"], f"squash-merged {m['branch']}")
+             for m in merged if g.is_ancestor(m["sha"], child)]
+    return min(cands) if cands else None
+
+
 def resolve_chain(g: Git, branches: list[str], base: str | None, tip: str | None) -> dict:
     base = base or g.default_base()
     if not g.sha(base):
@@ -284,10 +302,26 @@ def resolve_chain(g: Git, branches: list[str], base: str | None, tip: str | None
     if missing:
         die(f"unknown branch(es): {', '.join(missing)}")
 
+    # A squash-merged branch shares no commit with base, so ancestry cannot tell
+    # it is done. It leaves the stack; its tip still anchors the branch above.
+    # Only the bottom of the stack can have landed, so the scan stops at the
+    # first branch that has not.
+    merged: list[dict] = []
+    for b in chain[:-1]:
+        below_tip = merged_anchor(g, merged, b)
+        since = below_tip[1] if below_tip else g.out("merge-base", base, b)
+        if not squash_merged(g, b, base, since):
+            break
+        merged.append({"branch": b, "sha": g.sha(b)})
+    chain = chain[len(merged):]
+
     steps = []
     for parent, child in zip([base, *chain], chain):
         contained = g.is_ancestor(parent, child)
-        anchor = None if contained else reflog_anchor(g, parent, child)
+        anchor = None
+        if not contained:
+            squashed = merged_anchor(g, merged, child) if parent == base else None
+            anchor = squashed[1] if squashed else reflog_anchor(g, parent, child)
         steps.append({
             "parent": parent,
             "branch": child,
@@ -295,10 +329,11 @@ def resolve_chain(g: Git, branches: list[str], base: str | None, tip: str | None
             "own_commits": g.count(f"{anchor or parent}..{child}"),
             "up_to_date": contained,
         })
-    return {"base": base, "chain": chain, "steps": steps}
+    return {"base": base, "chain": chain, "merged": merged, "steps": steps}
 
 
-def derive_old_tip(g: Git, parent: str, child: str, override: str | None) -> tuple[str | None, str]:
+def derive_old_tip(g: Git, parent: str, child: str, override: str | None,
+                   merged: list[dict]) -> tuple[str | None, str]:
     """The tip `parent` had when `child` was built on it."""
     if override:
         sha = g.sha(override)
@@ -314,6 +349,9 @@ def derive_old_tip(g: Git, parent: str, child: str, override: str | None) -> tup
     anchor = reflog_anchor(g, parent, child)
     if anchor:
         cands.append((g.count(f"{anchor}..{child}"), anchor, f"reflog of {parent}"))
+    squashed = merged_anchor(g, merged, child)
+    if squashed:
+        cands.append(squashed)
     mb = g.out("merge-base", parent, child)
     if mb:
         cands.append((g.count(f"{mb}..{child}"), mb, f"merge-base with {parent}"))
@@ -330,7 +368,7 @@ def plan(g: Git, args) -> dict:
     if first is None:
         p["action"] = None
         return p
-    old, how = derive_old_tip(g, first["parent"], first["branch"], args.old_tip)
+    old, how = derive_old_tip(g, first["parent"], first["branch"], args.old_tip, p["merged"])
     p["action"] = {
         "onto": first["parent"],
         "onto_sha": g.sha(first["parent"]),
@@ -345,11 +383,15 @@ def plan(g: Git, args) -> dict:
 
 def print_plan(g: Git, p: dict) -> None:
     print(f"base: {p['base']}")
+    for m in p["merged"]:
+        print(f"  -- {m['branch']} ({g.short(m['sha'])})  <- squash-merged into {p['base']}, dropped")
     for s in p["steps"]:
         mark = "ok " if s["up_to_date"] else "!! "
         print(f"  {mark}{s['parent']} -> {s['branch']} "
               f"({s['own_commits']} commit(s), {g.short(s['sha'])})"
-              + ("" if s["up_to_date"] else "  <- diverged: parent was rewritten"))
+              + ("" if s["up_to_date"] else
+                 "  <- base moved on" if s["parent"] == p["base"] else
+                 "  <- diverged: parent was rewritten"))
     a = p["action"]
     if not a:
         print("\nnothing to do: every branch already contains its parent")
@@ -818,11 +860,20 @@ def do_verify(g: Git, args) -> int:
             print(f"  {b}: unchanged ({g.short(new)})")
             continue
         base = state.get("base", "HEAD")
-        n_old, n_new = g.count(f"{base}..{old}"), g.count(f"{base}..{b}")
+        # Compare what was replayed: commits below the old tip (a squash-merged
+        # parent, an amended parent's old version) are not the branch's own.
+        a = state.get("action") or {}
+        if a.get("old_tip") and g.is_ancestor(a["old_tip"], old):
+            old_rng, new_rng = f"{a['old_tip']}..{old}", f"{a['onto_sha']}..{b}"
+            rd_args = [old_rng, new_rng]
+        else:
+            old_rng, new_rng = f"{base}..{old}", f"{base}..{b}"
+            rd_args = [f"{old}...{b}"]
+        n_old, n_new = g.count(old_rng), g.count(new_rng)
         # A high creation factor makes range-diff pair commits even when the
         # propagated change rewrote much of them; unpaired lines then really mean
         # a commit was dropped or invented.
-        rd = g.out("range-diff", "--no-color", "--creation-factor=100", f"{old}...{b}")
+        rd = g.out("range-diff", "--no-color", "--creation-factor=100", *rd_args)
         unpaired = [l for l in rd.splitlines() if re.search(r"(<\s+-:|-:\s+-+\s+>)", l)]
         print(f"  {b}: {g.short(old)} -> {g.short(new)}  commits {n_old} -> {n_new}"
               + ("  COMMIT COUNT CHANGED" if n_old != n_new else ""))

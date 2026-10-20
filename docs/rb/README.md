@@ -22,6 +22,15 @@ newest tip they had that the stack tip still contains — which is what makes th
 `git rebase --onto <new-parent> <old-tip> <stack-tip> --update-refs` arguments
 correct, and one rebase enough for the whole stack.
 
+Once the bottom of the stack lands as a squash merge, its commits share nothing
+with the base, so neither ancestry nor a reflog says it is done. Each branch at
+the bottom is therefore probed by patch-id: if its change since the branch below
+it is already a single commit in the base, it is dropped, and its tip becomes the
+old tip the rest of the stack is replayed from. Keep the merged branch around
+until the rebase is done — without its tip there is nothing to anchor on.
+`verify` compares only the replayed commits, so the dropped ones do not count
+as lost.
+
 ## What it resolves without asking
 
 | class | how | reported |
