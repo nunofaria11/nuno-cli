@@ -57,7 +57,7 @@ _nu() {
     rb)
       # Subcommands only in third position; branch names anywhere after it.
       (( CURRENT == 3 )) && compadd -- plan report verify abort cleanup
-      compadd -- -y --yes -n --dry-run --base --tip --old-tip
+      compadd -- -y --yes -n --dry-run --base --old-tip --no-fetch --no-ticket-guard
       compadd -- ${(f)"$(_nu_branches)"}
       ;;
   esac

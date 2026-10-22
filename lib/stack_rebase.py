@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """stack-rebase: deterministic engine for rebasing a stack of dependent branches.
 
-The mechanical parts of a stacked rebase (chain discovery, --onto arithmetic, ref
-bookkeeping, replay of known resolutions, generated-file classes, line-disjoint
-three-way merges) are decided here. Only genuine semantic conflicts are handed
-back to the caller.
+The mechanical parts of a stacked rebase (the stack's recorded parents, the cut
+point below each branch, one rebase per branch in the worktree that holds it,
+replay of known resolutions, generated-file classes, line-disjoint three-way
+merges) are decided here. Only genuine semantic conflicts are handed back to the
+caller.
 
 Exit codes:
     0   nothing left to do (stack rebased, or already up to date)
@@ -12,9 +13,9 @@ Exit codes:
     20  precondition failed / operator input required
 
 All git behaviour tweaks are passed per invocation with `git -c`, plus a private
-attributes file under $GIT_COMMON_DIR/stack-rebase/. Nothing in the repository
-configuration or working tree is mutated, so a crashed run leaves no footprint
-beyond the rerere cache and our own state directory.
+attributes file under $GIT_COMMON_DIR/stack-rebase/. The only repository
+configuration written is each branch's stack parent (branch.<name>.nuParent and
+nuParentTip), recorded when a run finishes.
 """
 
 from __future__ import annotations
@@ -30,9 +31,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 DRIVER = "stack-take-theirs"
-STATE_VERSION = 1
+STATE_VERSION = 2
 MAX_STEPS = 500
 MAX_DIFF_LINES = 20_000
 
@@ -58,7 +60,10 @@ RERERE_RE = re.compile(r"(?:Resolved|Staged) '(?P<path>[^']+)' using previous re
 
 
 class Git:
-    def __init__(self) -> None:
+    """One worktree of the repository; a run's state is shared by all of them."""
+
+    def __init__(self, path: str | None = None) -> None:
+        self.path = path
         self.top = self._bare(["rev-parse", "--show-toplevel"])
         self.common = Path(
             self._bare(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -67,6 +72,8 @@ class Git:
         self.state_dir = self.common / "stack-rebase"
         self.attrs_file = self.state_dir / "attributes"
         self.state_file = self.state_dir / "state.json"
+        # Present while a run is unfinished, so any worktree can resume or abort it.
+        self.active = self.state_dir / "active"
         self.driver_log = self.state_dir / "driver.log"
         # A run can span several processes (pause, resolve, resume), so what was
         # resolved and what owes a regeneration has to outlive one of them.
@@ -74,7 +81,7 @@ class Git:
 
     # -- plumbing ----------------------------------------------------------
     def _bare(self, args: list[str]) -> str:
-        p = subprocess.run(["git", *args], capture_output=True, text=True)
+        p = subprocess.run(["git", *args], cwd=self.path, capture_output=True, text=True)
         if p.returncode:
             sys.stderr.write(p.stderr)
             sys.exit(20)
@@ -108,7 +115,7 @@ class Git:
     def must(self, *args: str) -> str:
         p = self.run(*args)
         if p.returncode:
-            die(f"git {' '.join(args)}\n{p.stdout}{p.stderr}")
+            die(f"git {' '.join(args)} (in {self.top})\n{p.stdout}{p.stderr}")
         return p.stdout.strip()
 
     # -- queries -----------------------------------------------------------
@@ -131,28 +138,23 @@ class Git:
     def rebase_active(self) -> bool:
         return (self.gitdir / "rebase-merge").exists() or (self.gitdir / "rebase-apply").exists()
 
-    def default_base(self) -> str:
-        head = self.out("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
-        if head:
-            name = head.rsplit("/", 1)[-1]
-            if self.sha(name):
-                return name
-        for cand in ("master", "main"):
-            if self.sha(cand):
-                return cand
-        die("cannot determine the default base branch; pass --base")
+    def current(self) -> str:
+        """The checked-out branch, or "" when HEAD is detached."""
+        return self.out("symbolic-ref", "--quiet", "--short", "HEAD")
 
-    def worktree_of(self, branch: str) -> str | None:
-        path = None
+    def worktrees(self) -> dict[str, str]:
+        """Branch -> path of the worktree that has it checked out."""
+        out: dict[str, str] = {}
+        path = ""
         for line in self.out("worktree", "list", "--porcelain").splitlines():
             if line.startswith("worktree "):
                 path = line[9:]
-            elif line == f"branch refs/heads/{branch}":
-                return path
-        return None
+            elif line.startswith("branch refs/heads/"):
+                out[line[18:]] = path
+        return out
 
 
-def die(msg: str, code: int = 20) -> None:
+def die(msg: str, code: int = 20) -> NoReturn:
     print(f"stack-rebase: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -233,6 +235,104 @@ def matches(path: str, patterns) -> bool:
 
 # ------------------------------------------------------------------------ plan
 
+# Per-branch stack metadata in the repository config: the parent a branch sits
+# on, and that parent's tip when it last did. Written by every finished run and
+# by `nu wt add --base <branch>`.
+PARENT, PARENT_TIP = "nuParent", "nuParentTip"
+DEFAULT_TICKET = r"[A-Za-z]+-[0-9]+"
+
+
+def recorded(g: Git) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for line in g.out("config", "--get-regexp", r"^branch\..*\.nuparent(tip)?$").splitlines():
+        key, _, value = line.partition(" ")
+        name, _, var = key[len("branch."):].rpartition(".")
+        out.setdefault(name, {})["tip" if var == PARENT_TIP.lower() else "parent"] = value
+    return out
+
+
+def record(g: Git, p: dict) -> None:
+    for s in p["steps"]:
+        tip = p["base_sha"] if s["parent"] == p["base"] else g.sha(f"refs/heads/{s['parent']}")
+        g.must("config", f"branch.{s['branch']}.{PARENT}", s["parent"])
+        g.must("config", f"branch.{s['branch']}.{PARENT_TIP}", tip)
+
+
+def default_branch(g: Git) -> str:
+    head = g.out("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if head:
+        return head.split("/", 1)[-1]
+    for cand in ("master", "main"):
+        if g.sha(f"refs/remotes/origin/{cand}") or g.sha(f"refs/heads/{cand}"):
+            return cand
+    die("cannot determine the default branch; name the base first (nu rb master b1 b2)")
+
+
+def is_base(g: Git, name: str, default: str) -> bool:
+    """A trunk or a remote-tracking ref: what a stack sits on, never part of it."""
+    return (name in (default, f"origin/{default}") or name.startswith("refs/remotes/")
+            or bool(g.sha(f"refs/remotes/{name}")))
+
+
+def resolve_base(g: Git, name: str, fetch: bool) -> str:
+    # The local copy of a trunk is usually behind; rebasing onto it lands the
+    # stack on a stale base.
+    ref = f"origin/{name}" if g.sha(f"refs/remotes/origin/{name}") else name
+    remote, _, branch = ref.partition("/")
+    if fetch and branch and g.sha(f"refs/remotes/{ref}"):
+        if g.run("fetch", "--quiet", remote, branch).returncode:
+            print(f"stack-rebase: fetching {ref} failed; using the last fetched one",
+                  file=sys.stderr)
+    if not g.sha(ref):
+        die(f"base {name!r} does not resolve")
+    return ref
+
+
+def resolve_chain(g: Git, args, rec: dict, default: str) -> tuple[str, list[str]]:
+    names, base = list(args.branches), args.base
+    if names and is_base(g, names[0], default):
+        if base:
+            die(f"two bases given: --base {base} and {names[0]}")
+        base = names.pop(0)
+    for n in names:
+        if is_base(g, n, default):
+            die(f"{n} is a base, not part of the stack: put it first (nu rb {n} b1 b2) "
+                f"or pass --base {n}")
+        if not g.sha(f"refs/heads/{n}"):
+            die(f"unknown branch {n!r}")
+    chain = names or infer_chain(g, rec, default)
+    if not base:
+        parent = rec.get(chain[0], {}).get("parent")
+        base = parent if parent and is_base(g, parent, default) else default
+    return resolve_base(g, base, not args.no_fetch), chain
+
+
+def infer_chain(g: Git, rec: dict, default: str) -> list[str]:
+    """The current branch plus its recorded parents below and children above."""
+    cur = g.current()
+    if not cur:
+        die("detached HEAD: name the stack (nu rb master b1 b2)")
+    if is_base(g, cur, default):
+        die(f"{cur} is a base: name the stack (nu rb {cur} b1 b2)")
+
+    def local(b: str | None) -> bool:
+        return bool(b) and bool(g.sha(f"refs/heads/{b}"))
+
+    chain = [cur]
+    while True:
+        parent = rec.get(chain[0], {}).get("parent")
+        if not local(parent) or parent in chain or is_base(g, parent, default):
+            break
+        chain.insert(0, parent)
+    while True:
+        kids = sorted(b for b, r in rec.items()
+                      if r.get("parent") == chain[-1] and b not in chain and local(b))
+        if len(kids) > 1:
+            die(f"the stack forks above {chain[-1]} ({', '.join(kids)}): name the branches")
+        if not kids:
+            return chain
+        chain.append(kids[0])
+
 
 def reflog_shas(g: Git, ref: str) -> list[str]:
     seen: list[str] = []
@@ -241,15 +341,6 @@ def reflog_shas(g: Git, ref: str) -> list[str]:
         if sha and sha not in seen:
             seen.append(sha)
     return seen
-
-
-def reflog_anchor(g: Git, ref: str, descendant: str) -> str | None:
-    """The most recent tip `ref` had that `descendant` still contains."""
-    cur = g.sha(ref)
-    for sha in reflog_shas(g, ref):
-        if sha != cur and g.is_ancestor(sha, descendant):
-            return sha
-    return None
 
 
 def squash_merged(g: Git, branch: str, base: str, since: str) -> bool:
@@ -263,146 +354,137 @@ def squash_merged(g: Git, branch: str, base: str, since: str) -> bool:
     return bool(probe) and g.out("cherry", base, probe, since).startswith("-")
 
 
-def merged_anchor(g: Git, merged: list[dict], child: str) -> tuple[int, str, str] | None:
-    """The squash-merged tip `child` was built on, as (commits replayed, sha, source)."""
-    cands = [(g.count(f"{m['sha']}..{child}"), m["sha"], f"squash-merged {m['branch']}")
-             for m in merged if g.is_ancestor(m["sha"], child)]
-    return min(cands) if cands else None
+def stack_commits(g: Git, branch: str, base: str) -> list[tuple[str, str]]:
+    """(sha, subject) of the commits `branch` has over `base`, newest first."""
+    out = []
+    for line in g.out("log", "--topo-order", "--format=%H %s", branch, "--not", base).splitlines():
+        sha, _, subject = line.partition(" ")
+        out.append((sha, subject))
+    return out
 
 
-def resolve_chain(g: Git, branches: list[str], base: str | None, tip: str | None) -> dict:
-    base = base or g.default_base()
-    if not g.sha(base):
-        die(f"base branch {base!r} does not exist")
-
-    if branches:
-        chain = branches
-    else:
-        tip = tip or g.out("rev-parse", "--abbrev-ref", "HEAD")
-        if tip == "HEAD":
-            die("detached HEAD: name the stack explicitly (stack_rebase.py plan b1 b2 b3)")
-        # A rewritten parent is no longer an ancestor of the tip, so containment
-        # alone cannot find it. Anchor each candidate on the newest tip it had
-        # that the stack tip still contains.
-        cands = [
-            b for b in g.out(
-                "for-each-ref", "--format=%(refname:short)", "refs/heads"
-            ).splitlines()
-            if b not in (tip, base) and not g.is_ancestor(b, base)
-        ]
-        below = []
-        for b in cands:
-            anchor = g.sha(b) if g.is_ancestor(b, tip) else reflog_anchor(g, b, tip)
-            if anchor and g.count(f"{base}..{anchor}") > 0:
-                below.append((g.count(f"{base}..{anchor}"), b))
-        below.sort()
-        chain = [b for _, b in below] + [tip]
-
-    missing = [b for b in chain if not g.sha(b)]
-    if missing:
-        die(f"unknown branch(es): {', '.join(missing)}")
-
-    # A squash-merged branch shares no commit with base, so ancestry cannot tell
-    # it is done. It leaves the stack; its tip still anchors the branch above.
-    # Only the bottom of the stack can have landed, so the scan stops at the
-    # first branch that has not.
-    merged: list[dict] = []
-    for b in chain[:-1]:
-        below_tip = merged_anchor(g, merged, b)
-        since = below_tip[1] if below_tip else g.out("merge-base", base, b)
-        if not squash_merged(g, b, base, since):
-            break
-        merged.append({"branch": b, "sha": g.sha(b)})
-    chain = chain[len(merged):]
-
-    steps = []
-    for parent, child in zip([base, *chain], chain):
-        contained = g.is_ancestor(parent, child)
-        anchor = None
-        if not contained:
-            squashed = merged_anchor(g, merged, child) if parent == base else None
-            anchor = squashed[1] if squashed else reflog_anchor(g, parent, child)
-        steps.append({
-            "parent": parent,
-            "branch": child,
-            "sha": g.sha(child),
-            "own_commits": g.count(f"{anchor or parent}..{child}"),
-            "up_to_date": contained,
-        })
-    return {"base": base, "chain": chain, "merged": merged, "steps": steps}
+def ticket_pattern(g: Git) -> re.Pattern | None:
+    p = g.run("config", "--get", "nu.rb.ticketPattern")
+    raw = p.stdout.strip() if p.returncode == 0 else DEFAULT_TICKET
+    return re.compile(raw) if raw else None
 
 
-def derive_old_tip(g: Git, parent: str, child: str, override: str | None,
-                   merged: list[dict]) -> tuple[str | None, str]:
-    """The tip `parent` had when `child` was built on it."""
-    if override:
-        sha = g.sha(override)
-        if not sha:
-            die(f"--old-tip {override!r} does not resolve")
-        return sha, "operator supplied"
+def ticket(pattern: re.Pattern | None, text: str) -> str | None:
+    m = pattern.match(text) if pattern else None
+    return m.group(0).upper() if m else None
 
-    cands: list[tuple[int, str, str]] = []
-    for ref in (f"refs/stack-backup/{parent}", f"backup/{parent}"):
-        sha = g.sha(ref)
-        if sha and g.is_ancestor(sha, child):
-            cands.append((g.count(f"{sha}..{child}"), sha, f"backup ref {ref}"))
-    anchor = reflog_anchor(g, parent, child)
-    if anchor:
-        cands.append((g.count(f"{anchor}..{child}"), anchor, f"reflog of {parent}"))
-    squashed = merged_anchor(g, merged, child)
-    if squashed:
-        cands.append(squashed)
-    mb = g.out("merge-base", parent, child)
-    if mb:
-        cands.append((g.count(f"{mb}..{child}"), mb, f"merge-base with {parent}"))
-    if not cands:
-        return None, "not found"
-    # The tightest anchor replays the fewest commits, so it is the correct one.
-    n, sha, how = min(cands)
-    return sha, f"{how}, replays {n} commit(s)"
+
+def derive_cut(g: Git, branch: str, olds: list[str], rec_tip: str | None, base: str,
+               commits: list[tuple[str, str]], pattern: re.Pattern | None) -> tuple[str, str]:
+    """The commit `branch` was built on: everything above it is the branch's own."""
+    # Index in `commits` (newest first) = how many commits a cut there replays.
+    pos = {sha: i for i, (sha, _) in enumerate(commits)}
+    exact: list[tuple[int, str, str]] = []
+    if rec_tip in pos:
+        exact.append((pos[rec_tip], rec_tip, "recorded parent tip"))
+    for old in olds:
+        tip = g.sha(f"refs/heads/{old}")
+        if tip in pos:
+            exact.append((pos[tip], tip, f"tip of {old}"))
+            continue
+        # A rewritten or squash-merged parent: the newest tip it had that the
+        # branch still contains.
+        hit = next((s for s in reflog_shas(g, f"refs/heads/{old}") if s in pos), None)
+        if hit:
+            exact.append((pos[hit], hit, f"reflog of {old}"))
+    if exact:
+        _, sha, how = min(exact)
+        return sha, how
+
+    # Nothing remembers the parent (deleted after its squash merge, never
+    # recorded): the oldest commits tagged with other tickets are its leftovers.
+    mine = ticket(pattern, branch)
+    if mine:
+        below: list[tuple[str, str]] = []
+        for sha, subject in reversed(commits):
+            t = ticket(pattern, subject)
+            if t is None or t == mine:
+                break
+            below.append((sha, t))
+        if below and len(below) < len(commits):
+            tags = ", ".join(sorted({t for _, t in below}))
+            return below[-1][0], f"below {mine}: {len(below)} commit(s) tagged {tags}"
+    return g.out("merge-base", base, branch), f"merge-base with {base}"
 
 
 def plan(g: Git, args) -> dict:
-    p = resolve_chain(g, args.branches, args.base, args.tip)
-    first = next((s for s in p["steps"] if not s["up_to_date"]), None)
-    if first is None:
-        p["action"] = None
-        return p
-    old, how = derive_old_tip(g, first["parent"], first["branch"], args.old_tip, p["merged"])
-    p["action"] = {
-        "onto": first["parent"],
-        "onto_sha": g.sha(first["parent"]),
-        "old_tip": old,
-        "old_tip_source": how,
-        "tip": p["chain"][-1],
-        "moves": [s["branch"] for s in p["steps"] if not s["up_to_date"] or
-                  p["chain"].index(s["branch"]) > p["chain"].index(first["branch"])],
-    }
-    return p
+    rec = recorded(g)
+    default = default_branch(g)
+    base, chain = resolve_chain(g, args, rec, default)
+    base_sha = g.sha(base)
+    pattern = ticket_pattern(g)
+    holders = g.worktrees()
+    merged: list[dict] = []
+    steps: list[dict] = []
+    below = None
+    for b in chain:
+        commits = stack_commits(g, b, base)
+        r = rec.get(b, {})
+        olds = [o for o in dict.fromkeys((below, r.get("parent")))
+                if o and not is_base(g, o, default)]
+        cut, how = derive_cut(g, b, olds, r.get("tip"), base, commits, pattern)
+        below = b
+        # A squash-merged branch shares no commit with the base, so only a
+        # patch-id probe tells it has landed. Only the bottom of a stack lands.
+        if not steps and (g.is_ancestor(b, base) or squash_merged(g, b, base, cut)):
+            merged.append({"branch": b, "sha": g.sha(b)})
+            continue
+        if not steps and args.old_tip:
+            cut = g.sha(args.old_tip)
+            if not cut or not g.is_ancestor(cut, b):
+                die(f"--old-tip {args.old_tip!r} is not an ancestor of {b}")
+            how = "operator supplied"
+        parent = steps[-1]["branch"] if steps else base
+        parent_tip = base_sha if parent == base else g.sha(f"refs/heads/{parent}")
+        own = commits[:next((i for i, (sha, _) in enumerate(commits) if sha == cut), len(commits))]
+        mine = ticket(pattern, b)
+        foreign: dict[str, int] = {}
+        for _, subject in own if mine else ():
+            t = ticket(pattern, subject)
+            if t and t != mine:
+                foreign[t] = foreign.get(t, 0) + 1
+        steps.append({
+            "branch": b, "parent": parent, "cut": cut, "cut_source": how,
+            "commits": len(own), "old_sha": g.sha(b), "worktree": holders.get(b),
+            "stale": cut != parent_tip or any(s["stale"] for s in steps),
+            "foreign": foreign,
+        })
+    return {"base": base, "base_sha": base_sha, "merged": merged, "steps": steps,
+            "home": g.top, "home_ref": g.current() or g.sha("HEAD")}
+
+
+def tilde(path: str) -> str:
+    home = str(Path.home())
+    return "~" + path[len(home):] if path.startswith(home + "/") else path
 
 
 def print_plan(g: Git, p: dict) -> None:
-    print(f"base: {p['base']}")
+    print(f"base: {p['base']} @ {g.short(p['base_sha'])}")
     for m in p["merged"]:
-        print(f"  -- {m['branch']} ({g.short(m['sha'])})  <- squash-merged into {p['base']}, dropped")
+        print(f"  -- {m['branch']}  squash-merged into {p['base']}, dropped")
     for s in p["steps"]:
-        mark = "ok " if s["up_to_date"] else "!! "
-        print(f"  {mark}{s['parent']} -> {s['branch']} "
-              f"({s['own_commits']} commit(s), {g.short(s['sha'])})"
-              + ("" if s["up_to_date"] else
-                 "  <- base moved on" if s["parent"] == p["base"] else
-                 "  <- diverged: parent was rewritten"))
-    a = p["action"]
-    if not a:
-        print("\nnothing to do: every branch already contains its parent")
+        print(f"  {'!!' if s['stale'] else 'ok'} {s['branch']}  "
+              f"{s['commits']} commit(s) on {s['parent']}")
+        if s["stale"]:
+            print(f"       cut {g.short(s['cut'])}  {s['cut_source']}")
+    stale = [s for s in p["steps"] if s["stale"]]
+    if not stale:
+        print("\nnothing to do: every branch already sits on its parent")
         return
-    print(f"\none-pass rebase, all intermediate refs move with --update-refs:")
-    print(f"  git rebase --onto {a['onto']} {g.short(a['old_tip']) if a['old_tip'] else '<OLD-TIP>'} "
-          f"{a['tip']} --update-refs")
-    print(f"  onto      {a['onto']} @ {g.short(a['onto_sha'])}")
-    print(f"  old tip   {g.short(a['old_tip']) if a['old_tip'] else 'UNKNOWN'} "
-          f"({a['old_tip_source']})")
-    print(f"  moves     {', '.join(a['moves'])}")
+    print("\none rebase per branch, bottom first, in the worktree that holds it:")
+    for s in stale:
+        print(f"  {tilde(s['worktree'] or p['home'])}$ "
+              f"git rebase --onto {s['parent']} {g.short(s['cut'])} {s['branch']}")
+    for s in stale:
+        if s["foreign"]:
+            tags = ", ".join(f"{n} commit(s) tagged {t}" for t, n in sorted(s["foreign"].items()))
+            print(f"\nticket guard: {s['branch']} would replay {tags}")
+            print("  pass --old-tip <sha> to cut below them, or --no-ticket-guard if they belong")
 
 
 # -------------------------------------------------------------- conflict model
@@ -659,9 +741,17 @@ def journal(g: Git, kind: str, with_reason: bool = True) -> list[str]:
     return seen
 
 
-def save_state(g: Git, p: dict) -> None:
+def save_state(g: Git, state: dict) -> None:
     g.state_dir.mkdir(parents=True, exist_ok=True)
-    g.state_file.write_text(json.dumps({"version": STATE_VERSION, "started": time.time(), **p}, indent=1))
+    g.state_file.write_text(json.dumps(state, indent=1))
+
+
+def last_state(g: Git) -> dict:
+    return json.loads(g.state_file.read_text()) if g.state_file.exists() else {}
+
+
+def active_state(g: Git) -> dict | None:
+    return last_state(g) if g.active.exists() else None
 
 
 def backup(g: Git, branches: list[str]) -> list[str]:
@@ -678,15 +768,17 @@ def backup(g: Git, branches: list[str]) -> list[str]:
     return made
 
 
-def preconditions(g: Git, p: dict) -> None:
-    dirty = g.out("status", "--porcelain", "--untracked-files=no")
-    if dirty:
-        die("working tree is not clean:\n" + dirty)
-    for b in p["chain"]:
-        wt = g.worktree_of(b)
-        if wt and Path(wt).resolve() != Path(g.top).resolve():
-            die(f"branch {b} is checked out in another worktree ({wt}); "
-                f"run stack-rebase from there")
+def preconditions(p: dict, guard: bool) -> None:
+    stale = [s for s in p["steps"] if s["stale"]]
+    for path in dict.fromkeys(s["worktree"] or p["home"] for s in stale):
+        w = Git(path)
+        if w.rebase_active():
+            die(f"{w.top} already has a rebase in progress")
+        dirty = w.out("status", "--porcelain", "--untracked-files=no")
+        if dirty:
+            die(f"{w.top} is not clean:\n{dirty}")
+    if guard and any(s["foreign"] for s in stale):
+        die("ticket guard: a branch would replay commits of other tickets (see the plan)")
 
 
 def driver_resolved(g: Git) -> list[str]:
@@ -730,7 +822,8 @@ def report(g: Git, entries: list[dict], driver: list[str], regen: list[str]) -> 
         print("regeneration owed before the stack is pushed:")
         for c in regen:
             print(f"  {c}")
-    print("\nResolve in the working tree, `git add` each path, then run the rebase again.")
+    print(f"\nResolve in {g.top}, `git add` each path, then run the rebase again "
+          "from any worktree.")
 
 
 def note_replays(g: Git, p: subprocess.CompletedProcess) -> None:
@@ -739,91 +832,127 @@ def note_replays(g: Git, p: subprocess.CompletedProcess) -> None:
         journal_add(g, "rerere", m.group("path"))
 
 
-def do_run(g: Git, args) -> int:
-    policy = load_policy(g)
-    _, generated = install_policy(g, policy)
-
-    if not g.rebase_active():
-        p = plan(g, args)
-        if not p["action"]:
-            print_plan(g, p)
-            return 0
-        a = p["action"]
-        if not a["old_tip"]:
-            print_plan(g, p)
-            die(f"cannot derive the old tip of {a['onto']}; pass --old-tip <sha> "
-                f"(see `git reflog show {a['onto']}`)")
-        preconditions(g, p)
-        made = backup(g, p["chain"])
-        save_state(g, p)
-        if not args.quiet:
-            print_plan(g, p)
-            if made:
-                print("\nbackups: " + ", ".join(made))
-        if args.dry_run:
-            return 0
-        g.driver_log.unlink(missing_ok=True)
-        g.journal.unlink(missing_ok=True)
-        # --empty=stop: a commit whose content already landed below is a decision,
-        # not something to drop silently.
-        note_replays(g, g.run("rebase", "--onto", a["onto"], a["old_tip"], a["tip"],
-                              "--update-refs", "--empty=stop"))
-
+def settle(w: Git, policy: dict, generated: list[str]) -> int:
+    """Drive one rebase to its end: 0 once it finished, 10 when it needs a decision."""
     for _ in range(MAX_STEPS):
-        if not g.rebase_active():
-            break
-        files = unmerged(g)
+        if not w.rebase_active():
+            return 0
+        files = unmerged(w)
         if not files:
-            if g.sha("REBASE_HEAD") and g.ok("diff-index", "--quiet", "HEAD"):
+            if w.sha("REBASE_HEAD") and w.ok("diff-index", "--quiet", "HEAD"):
                 print("=" * 72)
                 print("PAUSED: this commit is empty here -- its change already "
                       "landed in the history below")
-                print(g.out("log", "-1", "--format=%h %s", "REBASE_HEAD"))
-                print(g.out("show", "--stat", "--format=", "REBASE_HEAD"))
-                print("Confirm, then one of\n"
+                print(w.out("log", "-1", "--format=%h %s", "REBASE_HEAD"))
+                print(w.out("show", "--stat", "--format=", "REBASE_HEAD"))
+                print(f"Confirm, then one of, in {w.top}:\n"
                       "  git rebase --skip                        # drop the redundant commit\n"
                       "  git commit --allow-empty -C REBASE_HEAD  # keep it as an empty commit\n"
                       "then run the rebase again.")
                 return 10
             # rerere replayed it, a driver resolved it, or the caller staged a fix.
-            note_replays(g, g.run("rebase", "--continue"))
+            note_replays(w, w.run("rebase", "--continue"))
             continue
 
-        label = g.out("log", "-1", "--format=%h (%s)", "REBASE_HEAD")
+        label = w.out("log", "-1", "--format=%h (%s)", "REBASE_HEAD")
         pending: list[dict] = []
         progress = False
         for path, stages in sorted(files.items()):
-            e = classify(g, path, stages, policy, generated, label)
+            e = classify(w, path, stages, policy, generated, label)
             if e["kind"] in ("auto", "regenerate"):
-                (Path(g.top) / path).write_text(e["merged"])
-                g.must("add", "--", path)
-                journal_add(g, "auto" if e["kind"] == "auto" else "regen",
+                (Path(w.top) / path).write_text(e["merged"])
+                w.must("add", "--", path)
+                journal_add(w, "auto" if e["kind"] == "auto" else "regen",
                             path, e["reason"])
                 progress = True
                 continue
             if e.get("merged"):
                 # Narrow the markers to the lines that actually clash.
-                (Path(g.top) / path).write_text(e["merged"])
+                (Path(w.top) / path).write_text(e["merged"])
             pending.append(e)
         if pending:
             for title, kind in (("replayed from a previous resolution", "rerere"),
                                 ("auto-resolved so far", "auto"),
                                 ("generated, resolved but owed a regeneration", "regen")):
-                lines = journal(g, kind)
+                lines = journal(w, kind)
                 if lines:
                     print(f"{title}:")
                     for line in lines:
                         print(f"  {line}")
                     print()
-            owed = driver_resolved(g) + journal(g, "regen", with_reason=False)
-            report(g, pending, owed, regen_commands(policy, owed))
+            owed = driver_resolved(w) + journal(w, "regen", with_reason=False)
+            report(w, pending, owed, regen_commands(policy, owed))
             return 10
         if not progress:
-            die("no progress possible; inspect `git status` by hand")
+            die(f"no progress possible; inspect `git status` in {w.top}")
+    die(f"rebase still in progress after the step limit; inspect `git status` in {w.top}")
 
-    if g.rebase_active():
-        die("rebase still in progress after the step limit; inspect `git status`")
 
+def restore_home(w: Git, ref: str) -> None:
+    """Put back what the invoking worktree had checked out before it lent itself out."""
+    if ref in (w.current(), w.sha("HEAD")):
+        return
+    if w.sha(f"refs/heads/{ref}"):
+        w.must("switch", "--quiet", ref)
+    else:
+        w.must("checkout", "--quiet", "--detach", ref)
+
+
+def do_run(g: Git, args) -> int:
+    policy = load_policy(g)
+    state = active_state(g)
+    if state is None:
+        p = plan(g, args)
+        if not args.quiet:
+            print_plan(g, p)
+        stale = [s for s in p["steps"] if s["stale"]]
+        if not stale:
+            record(g, p)
+            return 0
+        preconditions(p, guard=not args.no_ticket_guard)
+        if args.dry_run:
+            return 0
+        made = backup(g, [s["branch"] for s in stale])
+        if made:
+            print("\nbackups: " + ", ".join(made))
+        g.driver_log.unlink(missing_ok=True)
+        g.journal.unlink(missing_ok=True)
+        state = {"version": STATE_VERSION, "started": time.time(), **p}
+        save_state(g, state)
+        g.active.touch()
+
+    for s in state["steps"]:
+        if not s["stale"] or s.get("done"):
+            continue
+        w = Git(s["worktree"] or state["home"])
+        _, generated = install_policy(w, policy)
+        if not w.rebase_active() and not s.get("onto"):
+            onto = (state["base_sha"] if s["parent"] == state["base"]
+                    else w.sha(f"refs/heads/{s['parent']}"))
+            # Saved before rebasing: a step that has an onto was started, so a
+            # resume never replays a branch that was finished by hand.
+            s["onto"] = onto
+            save_state(g, state)
+            # --empty=stop: a commit whose content already landed below is a
+            # decision, not something to drop silently.
+            r = w.run("rebase", "--onto", onto, s["cut"], s["branch"], "--empty=stop")
+            note_replays(w, r)
+            if r.returncode and not w.rebase_active():
+                die(f"git rebase failed in {w.top}:\n{r.stdout}{r.stderr}")
+        rc = settle(w, policy, generated)
+        if rc:
+            print(f"\nworktree: {w.top}")
+            return rc
+        if not w.is_ancestor(s["onto"], s["branch"]):
+            die(f"{s['branch']} does not sit on {s['parent']} after its rebase; "
+                f"inspect {w.top}, then `nu rb abort` or finish by hand")
+        if not s["worktree"]:
+            restore_home(w, state["home_ref"])
+        s["done"] = True
+        save_state(g, state)
+
+    record(g, state)
+    g.active.unlink(missing_ok=True)
     for title, kind in (("replayed from a previous resolution (rerere cache)", "rerere"),
                         ("auto-resolved", "auto"),
                         ("generated files, resolved mechanically", "regen")):
@@ -844,36 +973,22 @@ def do_run(g: Git, args) -> int:
 
 
 def do_verify(g: Git, args) -> int:
-    state = json.loads(g.state_file.read_text()) if g.state_file.exists() else {}
-    chain = args.branches or state.get("chain") or []
-    if not chain:
-        die("no recorded stack; pass the branches explicitly")
+    steps = [s for s in last_state(g).get("steps", []) if s.get("onto")]
+    if not steps:
+        die("no recorded run to verify")
     print("\nverification")
     bad = False
-    for b in chain:
-        old = g.sha(f"refs/stack-backup/{b}")
-        if not old:
-            print(f"  {b}: no backup ref, skipped")
-            continue
-        new = g.sha(b)
-        if old == new:
-            print(f"  {b}: unchanged ({g.short(new)})")
-            continue
-        base = state.get("base", "HEAD")
-        # Compare what was replayed: commits below the old tip (a squash-merged
+    for s in steps:
+        b, old = s["branch"], s["old_sha"]
+        new = g.sha(f"refs/heads/{b}")
+        # Compare what was replayed: commits below the cut (a squash-merged
         # parent, an amended parent's old version) are not the branch's own.
-        a = state.get("action") or {}
-        if a.get("old_tip") and g.is_ancestor(a["old_tip"], old):
-            old_rng, new_rng = f"{a['old_tip']}..{old}", f"{a['onto_sha']}..{b}"
-            rd_args = [old_rng, new_rng]
-        else:
-            old_rng, new_rng = f"{base}..{old}", f"{base}..{b}"
-            rd_args = [f"{old}...{b}"]
+        old_rng, new_rng = f"{s['cut']}..{old}", f"{s['onto']}..{new}"
         n_old, n_new = g.count(old_rng), g.count(new_rng)
         # A high creation factor makes range-diff pair commits even when the
         # propagated change rewrote much of them; unpaired lines then really mean
         # a commit was dropped or invented.
-        rd = g.out("range-diff", "--no-color", "--creation-factor=100", *rd_args)
+        rd = g.out("range-diff", "--no-color", "--creation-factor=100", old_rng, new_rng)
         unpaired = [l for l in rd.splitlines() if re.search(r"(<\s+-:|-:\s+-+\s+>)", l)]
         print(f"  {b}: {g.short(old)} -> {g.short(new)}  commits {n_old} -> {n_new}"
               + ("  COMMIT COUNT CHANGED" if n_old != n_new else ""))
@@ -889,18 +1004,36 @@ def do_verify(g: Git, args) -> int:
 
 
 def do_abort(g: Git, args) -> int:
-    if g.rebase_active():
-        print(g.out("rebase", "--abort") or "rebase aborted")
-    state = json.loads(g.state_file.read_text()) if g.state_file.exists() else {}
-    for s in state.get("steps", []):
-        b, was = s["branch"], s["sha"]
-        if g.sha(b) != was:
+    state = active_state(g)
+    if state is None:
+        die("no run in progress")
+    started = [s for s in state["steps"] if s.get("onto")]
+    for path in dict.fromkeys(s["worktree"] or state["home"] for s in started):
+        w = Git(path)
+        if w.rebase_active():
+            w.must("rebase", "--abort")
+            print(f"aborted the rebase in {w.top}")
+    holders = g.worktrees()
+    for s in started:
+        b, was = s["branch"], s["old_sha"]
+        if g.sha(f"refs/heads/{b}") == was:
+            continue
+        # A checked-out branch has to move with its worktree, or that worktree's
+        # index and files are left describing the rebased commit.
+        if b in holders:
+            Git(holders[b]).must("reset", "--quiet", "--keep", was)
+        else:
             g.must("update-ref", f"refs/heads/{b}", was)
-            print(f"restored {b} -> {g.short(was)}")
+        print(f"restored {b} -> {g.short(was)}")
+    if any(not s["worktree"] for s in started):
+        restore_home(Git(state["home"]), state["home_ref"])
+    g.active.unlink(missing_ok=True)
     return 0
 
 
 def do_cleanup(g: Git, args) -> int:
+    if g.active.exists():
+        die("a run is still in progress: finish it or `nu rb abort` first")
     for line in g.out("for-each-ref", "--format=%(refname)",
                       "refs/stack-backup", "refs/stack-backup-prev").splitlines():
         g.must("update-ref", "-d", line)
@@ -918,19 +1051,25 @@ def do_cleanup(g: Git, args) -> int:
 
 
 def do_report(g: Git, args) -> int:
-    if not g.rebase_active():
-        print("no rebase in progress")
+    state = active_state(g)
+    if state is None:
+        print("no run in progress")
+        return 0
+    s = next((s for s in state["steps"] if s.get("onto") and not s.get("done")), None)
+    w = Git(s["worktree"] or state["home"]) if s else g
+    if not w.rebase_active():
+        print("no rebase in progress; run again to continue")
         return 0
     policy = load_policy(g)
-    _, generated = install_policy(g, policy)
-    files = unmerged(g)
+    _, generated = install_policy(w, policy)
+    files = unmerged(w)
     if not files:
-        print("no unmerged files; rerun `run` to continue")
+        print("no unmerged files; run again to continue")
         return 0
-    label = g.out("log", "-1", "--format=%h (%s)", "REBASE_HEAD")
-    entries = [classify(g, p, s, policy, generated, label) for p, s in sorted(files.items())]
-    driver = driver_resolved(g)
-    report(g, entries, driver, regen_commands(policy, driver + list(files)))
+    label = w.out("log", "-1", "--format=%h (%s)", "REBASE_HEAD")
+    entries = [classify(w, p, st, policy, generated, label) for p, st in sorted(files.items())]
+    driver = driver_resolved(w)
+    report(w, entries, driver, regen_commands(policy, driver + list(files)))
     return 10
 
 
@@ -938,11 +1077,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="stack_rebase.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["plan", "run", "report", "verify", "abort", "cleanup"])
-    ap.add_argument("branches", nargs="*", help="stack order, bottom first (default: inferred)")
-    ap.add_argument("--base", help="branch the stack forks from (default: origin HEAD)")
-    ap.add_argument("--tip", help="top of the stack when inferring (default: current branch)")
-    ap.add_argument("--old-tip", help="pre-rewrite tip of the diverged parent")
-    ap.add_argument("--dry-run", action="store_true", help="plan, back up, but do not rebase")
+    ap.add_argument("branches", nargs="*",
+                    help="[base] then the stack, bottom first (default: the recorded stack "
+                         "of the current branch)")
+    ap.add_argument("--base", help="what the stack sits on (default: origin/<default branch>)")
+    ap.add_argument("--old-tip", help="cut point below the lowest branch to rebase")
+    ap.add_argument("--no-fetch", action="store_true", help="do not fetch the base first")
+    ap.add_argument("--no-ticket-guard", action="store_true",
+                    help="replay commits tagged with other tickets without refusing")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="plan and check preconditions, change nothing")
     ap.add_argument("--quiet", action="store_true",
                     help="skip the plan echo (the caller already showed it)")
     args = ap.parse_args()

@@ -219,6 +219,13 @@ wt_add() {
     fi
     step "creating $branch from $base"
     git -C "$main" worktree add --no-track -b "$branch" "$path" "$base"
+    # A branch cut from another local branch starts a stack: record the parent
+    # so `nu rb` can restack it later without being told the order.
+    if [ "$base" != "$(default_branch "$main")" ] \
+      && git -C "$main" show-ref --verify --quiet "refs/heads/$base"; then
+      git -C "$main" config "branch.$branch.nuParent" "$base"
+      git -C "$main" config "branch.$branch.nuParentTip" "$(git -C "$main" rev-parse "refs/heads/$base")"
+    fi
   fi
 
   local hook="$NU_HOOKS/$(basename "$main")/post-add"

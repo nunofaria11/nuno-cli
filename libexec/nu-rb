@@ -7,34 +7,39 @@ ENGINE="$NU_LIB/stack_rebase.py"
 
 usage() {
   cat <<'USAGE'
-usage: nu rb [branch ...] [options]
+usage: nu rb [base] [branch ...] [options]
        nu rb <subcommand>
 
-Replays a stack of dependent branches onto a rewritten parent in one pass, and
-resolves every conflict that has exactly one sane answer: resolutions recorded
-by rerere, lockfiles, generated files, and edits that touch disjoint lines.
-Anything that needs a judgement call stops the run.
+Rebases a stack of dependent branches onto its base, one rebase per branch in
+the worktree that holds it, and resolves every conflict that has exactly one
+sane answer: resolutions recorded by rerere, lockfiles, generated files, and
+edits that touch disjoint lines. Anything that needs a judgement call stops the
+run.
 
-Branches are given bottom-first; with none, the chain is inferred from the
-current branch (a rewritten parent is found through its reflog). Branches at the
-bottom that were squash-merged into the base are dropped from the stack.
+Name the stack once, bottom first, optionally led by its base:
+  nu rb master id-1-a id-2-b
+Every finished run records each branch's parent, so afterwards a bare `nu rb`
+from any branch of the stack restacks all of it. Branches at the bottom that
+were squash-merged into the base are dropped from the stack.
 
-  -y, --yes          do not ask before rewriting
-  -n, --dry-run      show the plan and take backups, rebase nothing
-  --base <branch>    branch the stack forks from (default: origin HEAD)
-  --tip <branch>     top of the stack when inferring (default: current branch)
-  --old-tip <sha>    pre-rewrite tip of the diverged parent, when the reflog
-                     reading looks wrong
+  -y, --yes            do not ask before rewriting
+  -n, --dry-run        show the plan and check preconditions, change nothing
+  --base <branch>      what the stack sits on (default: origin/<default branch>,
+                       fetched first; a local trunk name means its origin copy)
+  --old-tip <sha>      cut point below the lowest branch, when the plan's is wrong
+  --no-fetch           do not fetch the base first
+  --no-ticket-guard    replay commits tagged with another ticket anyway
 
 subcommands:
-  plan               print the chain and the exact rebase, change nothing
+  plan               print the stack and the exact rebases, change nothing
   report             re-print the conflicts of a paused run
   verify             range-diff every rewritten branch against its backup
-  abort              abort the rebase and restore every branch from backup
+  abort              abort the run and restore every branch and worktree
   cleanup            drop the backup refs and the run's state
 
-Backups live in refs/stack-backup/<branch>, invisible to `git branch`. Nothing
-in the repository config or working tree is modified.
+Backups live in refs/stack-backup/<branch>, invisible to `git branch`. The
+only config written is branch.<name>.nuParent and nuParentTip. The ticket guard
+reads its pattern from `git config nu.rb.ticketPattern` (empty disables it).
 USAGE
 }
 
@@ -49,7 +54,8 @@ while [ $# -gt 0 ]; do
     run) sub=run ;;
     -y | --yes) assume_yes=1 ;;
     -n | --dry-run) dry=1 ;;
-    --base | --tip | --old-tip)
+    --no-fetch | --no-ticket-guard) args+=("$1") ;;
+    --base | --old-tip)
       [ $# -ge 2 ] || die "$1 needs a value"
       args+=("$1" "$2")
       shift
@@ -74,8 +80,8 @@ engine() { python3 "$ENGINE" "$@"; }
 paused_footer() {
   printf '\n'
   step "stopped for a decision"
-  dim "resolve the files above, git add them, then: nu rb${args[0]+ ${args[*]}}"
-  dim "or hand it to an agent: /rebase${args[0]+ ${args[*]}}"
+  dim "resolve the files above, git add them, then: nu rb   (from any worktree)"
+  dim "or hand it to an agent: /rebase"
 }
 
 case "$sub" in
@@ -94,31 +100,33 @@ if [ "$dry" = 1 ]; then
   exec python3 "$ENGINE" run --dry-run ${args[0]+"${args[@]}"}
 fi
 
-# Mid-rebase HEAD is detached, so there is no chain to plan and nothing left to
-# confirm: the run just resumes where it stopped.
-rebase_in_progress() {
-  local dir
-  for dir in rebase-merge rebase-apply; do
-    dir=$(git rev-parse --git-path "$dir" 2>/dev/null) || return 1
-    [ -d "$dir" ] && return 0
-  done
-  return 1
+# A paused run resumes from any worktree: nothing is left to plan or confirm.
+run_active() {
+  local common
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  [ -f "$common/stack-rebase/active" ]
 }
 
-rebase_in_progress && assume_yes=1
+run_active && assume_yes=1
 
 quiet=()
 if [ "$assume_yes" != 1 ]; then
+  set +e
   plan_out=$(engine plan ${args[0]+"${args[@]}"})
+  rc=$?
+  set -e
+  [ "$rc" = 0 ] || exit "$rc"
   printf '%s\n' "$plan_out"
+  # The confirmed plan is the one that runs: the base was fetched already.
+  quiet=(--quiet --no-fetch)
   case "$plan_out" in
-    *"nothing to do"*) exit 0 ;;
+    *"nothing to do"*) ;;
+    *)
+      printf '\n'
+      confirm "rewrite these branches?" || die "aborted"
+      printf '\n'
+      ;;
   esac
-  printf '\n'
-  confirm "rewrite these branches?" || die "aborted"
-  printf '\n'
-  # The plan is already on screen; do not print it twice.
-  quiet=(--quiet)
 fi
 
 set +e

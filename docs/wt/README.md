@@ -32,7 +32,9 @@ nu wt add <branch> [-b <ref>] [--fetch] [--no-cd] [--no-hook]
 `add` picks its source in this order: an existing local branch, then
 `origin/<branch>` (tracked), otherwise a new branch off `origin/<default>`
 with no upstream so `git push -u` behaves. `-b/--base <ref>` overrides the last
-case.
+case. A `--base` that is another local branch starts a stack: the new branch
+records it as its parent (`branch.<name>.nuParent`), so [`nu rb`](../rb/) can
+restack the two without being told the order.
 
 A branch that is already checked out somewhere is not created twice — `add`
 just moves you there. A directory that exists at the target path but is *not* a
