@@ -60,6 +60,16 @@ _nu() {
       compadd -- -y --yes -n --dry-run --base --old-tip --no-fetch --no-ticket-guard
       compadd -- ${(f)"$(_nu_branches)"}
       ;;
+    rv)
+      if [[ $words[3] == render ]]; then
+        _files -g '*.json'
+        compadd -- --no-open
+        return
+      fi
+      (( CURRENT == 3 )) && compadd -- prep render
+      compadd -- --base --no-fetch --no-cd
+      compadd -- ${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin 2>/dev/null | sed 's|^origin/||' | sort -u)"}
+      ;;
   esac
 }
 

@@ -8,6 +8,7 @@ to register and nothing to build.
 |---|---|
 | `nu wt` — git worktrees: create, list, clean up | [docs/wt/](docs/wt/) |
 | `nu rb` — rebase a stack of dependent branches | [docs/rb/](docs/rb/) |
+| `nu rv` — review a branch or merge request: worktree, reading order, review page | [docs/rv/](docs/rv/) |
 
 What each command does lives in [`docs/`](docs/). This file is about installing
 the thing and working on it.
@@ -64,6 +65,7 @@ bin/nu                  dispatcher
 libexec/nu-<command>    one file per command; `# summary:` shows up in `nu help`
 lib/common.sh           colours, prompts, cd requests, repo resolution
 lib/stack_rebase.py     the stacked-rebase engine behind nu rb
+lib/review.py           review prep and the HTML review page behind nu rv
 shell/nu.zsh            nu() wrapper, wt alias, completion
 hooks/                  per-repo post-add hooks
 agents/skills/<name>/   agent skills that drive nu commands, linked into ~/.agents/skills

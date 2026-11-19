@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# summary: review a branch or merge request: worktree, reading order, review page
+set -euo pipefail
+. "${NU_LIB:?nu-rv must be run through the nu dispatcher}/common.sh"
+
+ENGINE="$NU_LIB/review.py"
+
+usage() {
+  cat <<'USAGE'
+usage: nu rv [prep] [target] [options]
+       nu rv render <review.json> [--no-open]
+
+prep (the default) gets a change ready to review. The target is one of:
+  (nothing)          the current branch, reviewed in place
+  <branch>           a local or remote branch
+  !123, 123          a merge request (GitLab) or pull request (GitHub) of origin
+  <MR or PR URL>     the same, by link
+
+It fetches the branch and its target, checks the branch out in a worktree next
+to the repo (nu wt add), fast-forwards a worktree that is behind, and writes
+meta.json and diff.patch to ~/.cache/nu/rv/<repo>/<branch>/. The diff is taken
+against the merge request's target branch, so a stacked MR shows only its own
+change. Without an MR: the parent nu rb recorded, else origin/<default>.
+
+It prints the size, a simple/complex verdict, and a first reading order. With
+the shell wrapper, it cds into the worktree.
+
+  --base <ref>       diff against <ref> instead
+  --no-fetch         use what is already fetched
+  --no-cd            stay where you are
+
+render checks the review.json an agent wrote against the captured diff, writes
+review.html next to it and opens it. Exit 2 means review.json is invalid; the
+errors say what to fix.
+USAGE
+}
+
+command -v python3 >/dev/null || die "python3 not found"
+[ -f "$ENGINE" ] || die "engine missing: $ENGINE"
+
+case "${1:-}" in
+  -h | --help | help) usage; exit 0 ;;
+  render) shift; exec python3 "$ENGINE" render "$@" ;;
+  prep) shift ;;
+esac
+exec python3 "$ENGINE" prep "$@"

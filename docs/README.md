@@ -7,6 +7,7 @@ pages explain the reasoning behind them.
 |---|---|---|
 | `nu wt` | git worktrees — create, list, clean up | [wt/](wt/) |
 | `nu rb` | rebase a stack of dependent branches, resolving what is mechanical | [rb/](rb/) |
+| `nu rv` | review a branch or merge request: worktree, reading order, review page | [rv/](rv/) |
 
 `nu help` lists whatever is in `libexec/` right now, which is the authoritative
 answer to "what commands exist". Installation and development notes are in the
