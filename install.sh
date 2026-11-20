@@ -42,6 +42,33 @@ for src in "$root"/cli/commands/*.md; do
   if [ -f "$src" ]; then link_agent "$src" "$agents/commands"; fi
 done
 
+# Adds herdr-app/keys.json's bindings to the app's keys.json where the key is free; a key bound
+# to something else stays as it is. The app's file is rewritten, never linked: Herdr and other
+# installers write it in place.
+merge_keys() {
+  local src=$1 dest=$2 tmp
+  if [ ! -f "$dest" ]; then
+    echo "warning: no $dest; open the Herdr app once, then re-run" >&2
+    return
+  fi
+  # One line per binding: added, or kept because the key is taken.
+  jq -r --slurpfile add "$src" '
+    . as $cur | $add[0] | to_entries[] as $s | $s.value | to_entries[]
+    | ($cur[$s.key][.key]) as $have
+    | if $have == null then "keys: added \($s.key) \(.key) → \(.value | tojson)"
+      elif $have != .value then "warning: keys: \($s.key) \(.key) is \($have | tojson); left as it is"
+      else empty end' "$dest"
+  tmp=$(mktemp "$dest.XXXXXX")
+  jq --slurpfile add "$src" '
+    reduce ($add[0] | to_entries[] as $s | $s.value | to_entries[] | {s: $s.key, k: .key, v: .value}) as $e
+      (.; if .[$e.s][$e.k] == null then .[$e.s][$e.k] = $e.v else . end)' "$dest" > "$tmp"
+  if jq -e --slurpfile new "$tmp" '. == $new[0]' "$dest" > /dev/null; then
+    rm -f "$tmp"
+  else
+    mv -f "$tmp" "$dest"
+  fi
+}
+
 # The Herdr desktop app hot-reloads mods/ ; the link keeps edits live.
 app_home="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
 if [ -d "$app_home" ]; then
@@ -49,6 +76,11 @@ if [ -d "$app_home" ]; then
     link_agent "${src%/}" "$app_home/mods"
   done
   command -v herdr-app > /dev/null 2>&1 && herdr-app check "$root/herdr-app/mods/worktrees"
+  if command -v jq > /dev/null 2>&1; then
+    merge_keys "$root/herdr-app/keys.json" "$app_home/keys.json"
+  else
+    echo "warning: jq is not on PATH; add herdr-app/keys.json to $app_home/keys.json by hand" >&2
+  fi
 else
   echo "no $app_home; skipped linking the Herdr app mods"
 fi

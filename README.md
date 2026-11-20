@@ -20,7 +20,9 @@ git clone https://github.com/nunofaria11/nuno-plugins ~/code/personal/nuno-plugi
 Symlinks `cli/bin/nu` into `~/.local/bin`, the nu skills and commands into `~/.agents/` (omp
 and Claude Code both read from there), `herdr-app/mods/*` into `~/.config/herdr-app/mods/`,
 and wires `cli/shell/nu.zsh` into `~/.zshrc`. Everything is a symlink, so edits are live;
-re-run after moving the repo or adding a skill, command or mod.
+re-run after moving the repo or adding a skill, command or mod. The one copy is
+`herdr-app/keys.json`, merged into the app's `keys.json` (see Leader keys): re-run after
+changing it.
 
 ## Herdr desktop app
 
@@ -67,3 +69,20 @@ In `~/.config/herdr-app/keys.json`, `global` section:
 picks which. `diff-base` shows status and diff against the stack parent `nu wt` recorded, else
 `origin/<default>`; `review` runs `nu rv` and waits for Enter, since a split closes when its
 program exits.
+
+### Leader keys
+
+`herdr-app/keys.json` holds tmux-style bindings: `ctrl-b`, then a key. `install.sh` adds each
+one to `~/.config/herdr-app/keys.json` when that key is free and warns when it is bound to
+something else (it needs `jq`).
+
+| keys | does |
+|---|---|
+| `ctrl-b b` | show or hide the sidebar |
+| `ctrl-b %` | split right |
+| `ctrl-b "` | split down |
+| `ctrl-b ctrl-b` | send `ctrl-b` to the program |
+
+The app passes each key string to GPUI, which reads space-separated keys as a sequence (not yet
+documented upstream: herdrdev/herdr-app#833). A second key that no binding uses goes to the
+program together with `ctrl-b`.
