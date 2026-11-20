@@ -53,8 +53,26 @@ main_worktree() {
   git worktree list --porcelain | sed -n 's/^worktree //p' | head -1
 }
 
-# Sibling directory convention: /path/to/flip -> /path/to/flip.worktrees
-worktrees_root() { printf '%s.worktrees\n' "$1"; }
+# Where a repo's worktrees go. `git config nu.worktreesRoot` wins: set in the repo
+# it is used as-is, set globally it gets the repo's directory name appended so two
+# repos never share a root. Default is the sibling convention
+# /path/to/flip -> /path/to/flip.worktrees. `~` expands; a relative value is
+# relative to the main worktree.
+worktrees_root() {
+  local main=$1 root
+  if root=$(git -C "$main" config --local --type=path --get nu.worktreesRoot 2>/dev/null); then
+    :
+  elif root=$(git -C "$main" config --global --type=path --get nu.worktreesRoot 2>/dev/null); then
+    root="$root/$(basename "$main")"
+  else
+    printf '%s.worktrees\n' "$main"
+    return
+  fi
+  case "$root" in
+    /*) printf '%s\n' "$root" ;;
+    *) printf '%s/%s\n' "$main" "$root" ;;
+  esac
+}
 
 default_branch() {
   local head

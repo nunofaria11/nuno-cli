@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# nu rv for the current branch, kept on screen: a Herdr split closes when its
+# program exits.
+set -uo pipefail
+
+nu rv --no-cd "$@"
+printf '\n(enter to close) '
+read -r _ || :

@@ -839,20 +839,56 @@ def ide_prefix(worktree: Path, path: str) -> str:
     return f"vscode://file{quote(str(full))}:"
 
 
-def finding_card(n: int, f: dict, ide: str | None) -> str:
+def finding_codes(findings: list[dict]) -> list[str]:
+    """C1, H1, H2, M1, …: the severity's letter and its count among the findings of that severity."""
+    seen = dict.fromkeys(SEVERITIES, 0)
+    codes = []
+    for f in findings:
+        seen[f["severity"]] += 1
+        codes.append(f"{f['severity'][0].upper()}{seen[f['severity']]}")
+    return codes
+
+
+def fix_prompt(code: str, f: dict, meta: dict, review_path: Path) -> str:
+    """A prompt that lets an agent with no other context fix this one finding."""
+    where = f["where"]
+    if f.get("file"):
+        loc = f["file"]
+        if "line" in f:
+            end = f.get("end_line", f["line"])
+            loc += f", line {f['line']}" if end == f["line"] else f", lines {f['line']}-{end}"
+            if f.get("side") == "old":
+                loc += " of the old file"
+        where += f" ({loc})"
+    lines = [
+        f"Fix review finding {code} in the worktree {meta['worktree']} (branch {meta['branch']}).",
+        "",
+        f"{code}: {f['title']} [{f['severity'].title()}, {SECTIONS[f['section']]}]",
+        f["body"],
+        f"Where: {where}",
+        f"Why: {f['why']}",
+    ]
+    if f.get("fix"):
+        lines.append(f"Fix: {f['fix']}")
+    lines += ["", f"The full review is in {review_path}. Fix only this finding, in that worktree. Do not push."]
+    return "\n".join(lines)
+
+
+def finding_card(code: str, f: dict, ide: str | None, prompt: str) -> str:
     sev = f["severity"]
     rows = [("Where", f["where"]), ("Why", f["why"])] + ([("Fix", f["fix"])] if f.get("fix") else [])
     dl = "".join(f"<dt>{k}</dt><dd>{inline(v)}</dd>" for k, v in rows)
     open_link = (f' <a class="btn" href="{esc(ide + str(f.get("line", 1)))}">Open in IDE</a>' if ide else "")
     return (
-        f'<article class="finding sev-{sev}" id="f{n}" tabindex="-1">'
-        f'<header><span class="pill {sev}">{sev.title()}</span>'
+        f'<article class="finding sev-{sev}" id="{code}" tabindex="-1">'
+        f'<header><a class="code-id" href="#{code}">{code}</a><span class="pill {sev}">{sev.title()}</span>'
         f'<span class="section">{SECTIONS[f["section"]]}</span>'
         f'<h4>{inline(f["title"])}</h4></header>'
         f'<div class="prose">{prose(f["body"])}</div><dl>{dl}</dl>'
         f'<div class="cc"><pre>{esc(f["comment"])}</pre>'
-        f'<div class="actions"><button class="btn copy" type="button" data-comment="{esc(f["comment"])}">'
-        f'Copy comment</button>{open_link}</div></div></article>'
+        f'<div class="actions"><button class="btn copy" type="button" data-copy="{esc(f["comment"])}">'
+        f'Copy comment</button><button class="btn copy" type="button" data-copy="{esc(prompt)}">'
+        f'Fix locally</button>{open_link}</div></div></article>'
     )
 
 
@@ -912,7 +948,7 @@ def file_id(path: str) -> str:
     return "file-" + re.sub(r"[^A-Za-z0-9_-]", "-", path)
 
 
-def render_html(review: dict, meta: dict, diffs: dict[str, dict]) -> tuple[str, list[str]]:
+def render_html(review: dict, meta: dict, diffs: dict[str, dict], review_path: Path) -> tuple[str, list[str]]:
     worktree = Path(meta["worktree"])
     files_meta = {f["path"]: f for f in meta["files"]}
     findings = review["findings"]
@@ -936,7 +972,7 @@ def render_html(review: dict, meta: dict, diffs: dict[str, dict]) -> tuple[str, 
     step_of = {p: i for i, s in enumerate(steps) for p in s["files"]}
 
     order = sorted(range(len(findings)), key=lambda i: SEVERITIES.index(findings[i]["severity"]))
-    number = {i: k + 1 for k, i in enumerate(order)}
+    codes = finding_codes(findings)
 
     anchored: dict[str, dict] = {}
     above_file: dict[str, list[str]] = {}
@@ -944,7 +980,7 @@ def render_html(review: dict, meta: dict, diffs: dict[str, dict]) -> tuple[str, 
     highlight: dict[str, dict] = {}
     for i, f in enumerate(findings):
         path = f.get("file")
-        card = finding_card(number[i], f, ide(path) if path else None)
+        card = finding_card(codes[i], f, ide(path) if path else None, fix_prompt(codes[i], f, meta, review_path))
         diff = diffs.get(path) if path else None
         anchor = anchor_of(f, diff)
         if anchor:
@@ -954,7 +990,7 @@ def render_html(review: dict, meta: dict, diffs: dict[str, dict]) -> tuple[str, 
         elif diff is not None:
             above_file.setdefault(path, []).append(card)
             if "line" in f:
-                notes.append(f"finding {number[i]} ({path}, line {f['line']}) is not on a displayed "
+                notes.append(f"finding {codes[i]} ({path}, line {f['line']}) is not on a displayed "
                              "line; shown above the file")
         else:
             general.append(card)
@@ -1001,7 +1037,8 @@ def render_html(review: dict, meta: dict, diffs: dict[str, dict]) -> tuple[str, 
     chips = " ".join(f'<span class="pill {sev}">{counts[sev]} {sev}</span>' for sev in SEVERITIES if counts[sev])
     if findings:
         items = "".join(
-            f'<li><a href="#f{number[i]}"><span class="pill {findings[i]["severity"]}">'
+            f'<li><a href="#{codes[i]}"><span class="code-id">{codes[i]}</span> '
+            f'<span class="pill {findings[i]["severity"]}">'
             f'{findings[i]["severity"].title()}</span> {inline(findings[i]["title"])}</a>'
             f'<span class="loc">{inline(findings[i]["where"])}</span></li>' for i in order)
         parts.append(f'<section class="attention" id="findings"><h2>Needs your attention {chips}</h2>'
@@ -1057,27 +1094,29 @@ CSS = """
 --surface:#161b22;--accent:#4493f8;--add:#12261e;--del:#25171c;--hl:#3b2f0b;--crit:#ff7b72;--high:#ffa657;
 --med:#d29922;--low:#8d96a0;--ok:#3fb950}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",
-Helvetica,Arial,sans-serif;display:grid;grid-template-columns:280px minmax(0,1fr)}
-code,pre,.diff{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,
+"Segoe UI",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+display:grid;grid-template-columns:300px minmax(0,1fr)}
+code,pre,.diff{font-family:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;font-size:14px}
 code{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:0 4px}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .rail{position:sticky;top:0;height:100vh;overflow:auto;padding:16px;border-right:1px solid var(--border);
-background:var(--surface);font-size:13px}
+background:var(--surface);font-size:14.5px}
 .rail>a{display:block;font-weight:600;margin:10px 0 4px;color:var(--fg)}
 .rail ul{list-style:none;margin:0;padding-left:12px}.rail li a{color:var(--muted);display:block;
 overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.count{background:var(--high);color:var(--bg);border-radius:9px;padding:0 6px;font-size:11px}
+.count{background:var(--high);color:var(--bg);border-radius:9px;padding:0 6px;font-size:12px}
 main{padding:24px 32px;max-width:1280px}
-h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 8px}h4{margin:0;font-size:14px}
-.meta,.loc,.hint,footer{color:var(--muted)}footer{margin:40px 0 8px;font-size:12px}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:20px;margin:28px 0 8px}h4{margin:0;font-size:16px}
+.meta,.loc,.hint,footer{color:var(--muted)}footer{margin:40px 0 8px;font-size:13px}
 .verdict{border-left:4px solid;padding:10px 14px;margin:16px 0;background:var(--surface);border-radius:4px}
 .verdict.merge{border-color:var(--ok)}.verdict.fix{border-color:var(--med)}.verdict.block{border-color:var(--crit)}
 .warn{border-left:4px solid var(--med);padding:6px 12px;margin:8px 0;background:var(--surface)}
-.pill{display:inline-block;border-radius:10px;padding:0 8px;font-size:11.5px;font-weight:600;color:var(--bg)}
+.code-id{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-weight:700;color:var(--fg)}
+.pill{display:inline-block;border-radius:10px;padding:0 8px;font-size:12.5px;font-weight:600;color:var(--bg)}
 .pill.critical{background:var(--crit)}.pill.high{background:var(--high)}.pill.medium{background:var(--med)}
 .pill.low{background:var(--low)}
-.attention ol{padding-left:22px}.attention li{margin:4px 0}.attention .loc{margin-left:8px;font-size:12.5px}
+.attention ol{padding-left:22px}.attention li{margin:4px 0}.attention .loc{margin-left:8px;font-size:14px}
 table{border-collapse:collapse}.intent table{width:100%}.intent td,.intent th{border:1px solid var(--border);
 padding:6px 8px;text-align:left;vertical-align:top}
 .crit{font-weight:600}.crit.met{color:var(--ok)}.crit.partial{color:var(--med)}.crit.missing{color:var(--crit)}
@@ -1086,19 +1125,19 @@ padding:6px 8px;text-align:left;vertical-align:top}
 .file{border:1px solid var(--border);border-radius:6px;margin:12px 0;overflow:hidden}
 .file summary{display:flex;gap:10px;align-items:center;padding:8px 12px;background:var(--surface);
 cursor:pointer;position:sticky;top:0;z-index:1}
-.file .path{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;flex:1;overflow-wrap:anywhere}
-.status{font-size:11px;text-transform:uppercase;color:var(--muted);min-width:64px}
+.file .path{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:14px;flex:1;overflow-wrap:anywhere}
+.status{font-size:12px;text-transform:uppercase;color:var(--muted);min-width:64px}
 .a{color:var(--ok)}.d{color:var(--crit)}
 .btn{border:1px solid var(--border);background:var(--bg);color:var(--fg);border-radius:6px;padding:3px 10px;
-font-size:12px;cursor:pointer}.btn.small{padding:1px 8px}
+font-size:13px;cursor:pointer}.btn.small{padding:1px 8px}
 .diff{width:100%;table-layout:fixed}
 .diff td{padding:0 8px;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}
-.diff col.ln{width:52px}.diff td.ln{text-align:right;color:var(--muted);user-select:none}
+.diff col.ln{width:56px}.diff td.ln{text-align:right;color:var(--muted);user-select:none}
 .diff td.ln.new{cursor:pointer}.diff td.ln.new:hover{color:var(--accent);text-decoration:underline}
 .diff tr.add td{background:var(--add)}.diff tr.del td{background:var(--del)}
 .diff tr.hl td.code{background:var(--hl)}
 .diff tr.hunk td{background:var(--surface);color:var(--muted);padding:4px 8px}
-.diff tr.anchor td{padding:8px 12px;white-space:normal;font:14px/1.5 -apple-system,BlinkMacSystemFont,
+.diff tr.anchor td{padding:8px 12px;white-space:normal;font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,
 "Segoe UI",sans-serif}
 .finding{border:1px solid var(--border);border-left:4px solid;border-radius:6px;padding:10px 14px;margin:10px 0;
 background:var(--bg)}
@@ -1106,7 +1145,7 @@ background:var(--bg)}
 .finding.sev-critical{border-left-color:var(--crit)}.finding.sev-high{border-left-color:var(--high)}
 .finding.sev-medium{border-left-color:var(--med)}.finding.sev-low{border-left-color:var(--low)}
 .finding header{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.finding .section{color:var(--muted);font-size:12px}
+.finding .section{color:var(--muted);font-size:13px}
 .finding dl{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:8px 0}
 .finding dt{font-weight:600;color:var(--muted)}.finding dd{margin:0}
 .cc pre{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px;
@@ -1121,7 +1160,7 @@ JS = """
 const copyText=async t=>{try{await navigator.clipboard.writeText(t)}catch{const a=document.createElement('textarea');
 a.value=t;document.body.append(a);a.select();document.execCommand('copy');a.remove()}};
 document.addEventListener('click',e=>{const b=e.target.closest('button.copy');
-if(b){copyText(b.dataset.comment).then(()=>{b.textContent='Copied';setTimeout(()=>b.textContent='Copy comment',1500)});return}
+if(b){const label=b.dataset.label??=b.textContent;copyText(b.dataset.copy).then(()=>{b.textContent='Copied';setTimeout(()=>b.textContent=label,1500)});return}
 const ln=e.target.closest('td.ln.new[data-l]');if(ln){const f=ln.closest('[data-ide]');if(f)location.href=f.dataset.ide+ln.dataset.l}});
 const reveal=()=>{const el=location.hash&&document.getElementById(location.hash.slice(1));
 if(el){let d=el.closest('details');while(d){d.open=true;d=d.parentElement.closest('details')}el.scrollIntoView({block:'center'})}};
@@ -1159,7 +1198,7 @@ def render(args: argparse.Namespace) -> int:
             print(f"  {e}", file=sys.stderr)
         return 2
 
-    page, notes = render_html(review, meta, diffs)
+    page, notes = render_html(review, meta, diffs, review_path)
     out = out_dir / "review.html"
     out.write_text(page)
     for note in notes:

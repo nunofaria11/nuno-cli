@@ -268,10 +268,11 @@ wt_list() {
 }
 
 remove_worktree() {
-  local main="$1" path="$2" verdict="$3" force="$4"
+  local main="$1" path="$2" verdict="$3" force="$4" wtroot
+  wtroot=$(worktrees_root "$main")
   case "$path" in
-    */*.worktrees/?*) ;;
-    *) die "refusing to remove '$path': not inside a .worktrees directory" ;;
+    "$wtroot"/?*) ;;
+    *) die "refusing to remove '$path': not inside $wtroot" ;;
   esac
 
   if [ "$verdict" = prunable ]; then

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Everything this checkout changed against its base, committed or not, in less.
+# Base is the stack parent nu wt recorded, else origin/<default>. Meant for a
+# Herdr split (terminal.open), which closes when this exits.
+set -euo pipefail
+
+branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo HEAD)
+base=$(git config --get "branch.$branch.nuParent" 2>/dev/null || :)
+if [ -z "$base" ]; then
+  base=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/||')
+  [ -n "$base" ] || base=origin/master
+fi
+merge_base=$(git merge-base "$base" HEAD)
+
+{
+  printf '%s vs %s (%s)\n\n' "$branch" "$base" "$(git rev-parse --short "$merge_base")"
+  git -c color.status=always status --short
+  printf '\n'
+  git -c color.ui=always diff --stat "$merge_base"
+  printf '\n'
+  git -c color.ui=always diff "$merge_base"
+} | less -R

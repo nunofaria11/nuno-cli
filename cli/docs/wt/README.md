@@ -8,6 +8,10 @@ slashes turned into dashes:
 /Users/nuno/code/flipnext/flip.worktrees/act-4171-invite-code-service-publish-...
 ```
 
+`git config nu.worktreesRoot <dir>` moves them. Set inside a repo the directory is
+used as-is; set with `--global` every repo gets its own subdirectory under it
+(`<dir>/flip/...`). `~` expands, a relative value is relative to the main worktree.
+
 ```sh
 wt add act-1234-some-ticket   # create (or reuse) and cd into it
 wt add feature/x -b master    # branch off something other than origin/HEAD
@@ -77,7 +81,7 @@ nu wt clean [-n] [-y] [--no-fetch] [--no-size] [--force] [--delete-branches]
 |---|---|---|
 | `merged` | HEAD is an ancestor of the default branch, or the branch has no commits of its own | yes |
 | `gone` | the upstream branch was deleted — the usual footprint of a squash-merged MR | yes |
-| `orphan` | a directory in `*.worktrees/` that git does not know about | yes |
+| `orphan` | a directory in the worktrees root that git does not know about | yes |
 | `prunable` | git has a worktree registered whose directory is gone | yes |
 | `keep` | uncommitted or untracked files, unpushed commits, an open MR, or detached HEAD | no |
 
@@ -91,7 +95,7 @@ branch is — `wt rm <name> --force` is the deliberate way out.
 a pruned remote (`--no-fetch` skips it). Nothing is removed without a `y` per
 worktree unless you pass `-y`; with no terminal to ask on it reports and stops.
 `orphan` directories are deleted with `rm -rf`, which is why removal refuses
-any path that is not inside a `*.worktrees/` directory.
+any path that is not inside the repo's worktrees root.
 
 `-n/--dry-run` reports and removes nothing. `--delete-branches` also drops the
 local branch of each worktree it removed, and keeps it when git objects.

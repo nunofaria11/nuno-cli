@@ -82,8 +82,12 @@ and fall back to their source text offline.
   criteria, and every finding ordered by severity.
 - **Steps:** the agent's reading order. Each step has its explanation, then the
   diffs of its files with each finding placed under the line it is about.
-- **Findings:** each has a *Copy comment* button for the GitLab comment and an
-  *Open in IDE* link. `j` / `k` jump between findings.
+- **Findings:** each has a code, the severity's letter and its count among
+  findings of that severity in `review.json` order (`C1`, `H1`, `H2`, `M1`), and
+  `#H2` links to it. Each has a *Copy comment* button for the GitLab comment, a
+  *Fix locally* button that copies a self-contained fix prompt for an agent
+  (code, worktree, location, problem, why, fix), and an *Open in IDE* link.
+  `j` / `k` jump between findings.
 - **IDE links:** Kotlin and Java files open in IntelliJ (`idea://`). TypeScript,
   HTML and styles open in VS Code (`vscode://`). Any other file goes to whichever
   of the two its nearest build file points at: Gradle or Maven means IntelliJ,

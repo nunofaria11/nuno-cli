@@ -1,0 +1,8 @@
+{
+  "name": "skills",
+  "description": "Standalone skills: gcx (Grafana Cloud CLI), simple-english (plain-English rewriting), find-skills (discover installable skills).",
+  "version": "1.0.0",
+  "author": {
+    "name": "Nuno Faria"
+  }
+}

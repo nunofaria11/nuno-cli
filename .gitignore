@@ -1,2 +1,6 @@
 .DS_Store
 __pycache__/
+
+# Written by the Herdr app into every mod folder it loads.
+herdr-app/mods/*/gpui-kit.d.ts
+herdr-app/mods/*/jsconfig.json

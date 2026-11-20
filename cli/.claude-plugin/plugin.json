@@ -1,0 +1,8 @@
+{
+  "name": "nu",
+  "description": "Skills and commands that drive the nu CLI: review a branch or MR in its own worktree (nu rv), rebase stacked branches (nu rb), manage worktrees (nu wt). Requires nu on PATH: run install.sh from the repo root.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Nuno Faria"
+  }
+}

@@ -135,9 +135,10 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         page = Path(p.stdout.strip()).read_text()
         row = page.index('data-l="6">6</td>')
-        card = page.index('id="f1"')
+        card = page.index('id="H1"')
         self.assertLess(row, card, "the finding card must follow the line it is about")
-        self.assertIn('data-comment="issue (blocking):', page)
+        self.assertIn('data-copy="issue (blocking):', page)
+        self.assertIn("Fix review finding H1 in the worktree", page)
         # The lockfile was in no step, so it lands in the catch-all step instead of failing.
         self.assertIn("Generated files, lockfiles, translations and changelog", page)
 

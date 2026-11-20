@@ -123,7 +123,7 @@ Pick the format:
 
 **Inline:** write the review into the chat as described in `Inline output`.
 
-**HTML:** write `review.json` to `meta.paths.review_json` (schema in `HTML output`), run `nu rv render <that path>`, and fix every error it reports until it exits 0. Then reply in chat with only: the verdict sentence, the finding count per severity, and the path of `review.html`. Do not repeat the review in chat.
+**HTML:** write `review.json` to `meta.paths.review_json` (schema in `HTML output`), run `nu rv render <that path>`, and fix every error it reports until it exits 0. Then reply in chat with only: the verdict sentence, the finding count per severity, one line per finding with its code and title, and the path of `review.html`. Do not repeat the review in chat.
 
 ## Inline output
 
@@ -146,16 +146,20 @@ Lead with the verdict. Then say what the branch does. Then give the findings, wo
 <Findings, worst first, or "None found.">
 ```
 
+### Finding codes
+
+Every finding has a code the user can refer to, such as "fix H2". The code is the severity's letter (`C`ritical, `H`igh, `M`edium, `L`ow) and the finding's count among the findings of that severity, in the order you list them: `C1`, `H1`, `H2`, `M1`. The HTML renderer derives the same codes from the order of `findings` in `review.json`, so list them there in the order of the inline format. When the user later names a code, it means that finding.
+
 ### Finding format
 
-Each finding is a numbered item: a plain title, the severity in brackets, then two or three short lines.
+Each finding is a list item: its code and a plain title in bold, the severity in brackets, then two or three short lines.
 
 ```
-1. **The retry loop never stops** [Critical]
-   The client retries forever when the server answers with a 500 error. Each retry waits 200 ms, so one bad deploy floods the API.
-   - Where: `api_client.dart`, in `_retry()`
-   - Why: the three other clients in the same folder use `BackoffPolicy`. This one does not.
-   - Fix: use `BackoffPolicy.exponential` and stop after five tries.
+- **C1 · The retry loop never stops** [Critical]
+  The client retries forever when the server answers with a 500 error. Each retry waits 200 ms, so one bad deploy floods the API.
+  - Where: `api_client.dart`, in `_retry()`
+  - Why: the three other clients in the same folder use `BackoffPolicy`. This one does not.
+  - Fix: use `BackoffPolicy.exponential` and stop after five tries.
 ```
 
 `Where` and `Why` are always present. `Why` carries the evidence, so it names the call site, the sibling file, or the repo rule that the change breaks. `Fix` appears only when you know a concrete one.
@@ -194,7 +198,8 @@ Every finding must name a real file and a real place inside it. If you cannot na
 - `verdict.decision`: `merge`, `fix` or `block`.
 - `intent`: omit when there is no ticket. `status` is `met`, `partial`, `missing` or `unclear`.
 - `steps`: the reading order. Use the user's three stages as the backbone: entry point first, then the data flow in the order data moves, then tests. Larger changes split the data flow into more steps. Each step covers one concept, puts definitions before their consumers, and keeps a contract with its implementation. Every changed file belongs to exactly one step. Noise files may be left out; the renderer collects them. `diagram` is optional Mermaid; add one only when the data flow crosses three or more components.
-- `findings`: `section` is `bugs`, `behavior` or `standards`. `severity` is `critical`, `high`, `medium` or `low`. `file` is the repo-relative path. `line` and `end_line` are line numbers in the new file (`side: "new"`, the default) or the old file for removed lines (`side: "old"`). A finding whose line is shown in the diff is placed under it. Otherwise it is shown above its file, or in "Findings outside the diff" for a call site in an unchanged file.
+- `findings`: `section` is `bugs`, `behavior` or `standards`. `severity` is `critical`, `high`, `medium` or `low`. Do not write codes; the renderer derives them (see `Finding codes`). `file` is the repo-relative path. `line` and `end_line` are line numbers in the new file (`side: "new"`, the default) or the old file for removed lines (`side: "old"`). A finding whose line is shown in the diff is placed under it. Otherwise it is shown above its file, or in "Findings outside the diff" for a call site in an unchanged file.
+- Each finding card has a *Fix locally* button. It copies a prompt with the code, the worktree, the location and the `body`, `why` and `fix` text, so write those fields to stand alone.
 - Prose fields are plain text. Use backticks for identifiers. Separate paragraphs with a blank line; lines starting with `- ` become a list.
 
 ### The `comment` field
