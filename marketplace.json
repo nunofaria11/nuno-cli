@@ -4,7 +4,7 @@
     "name": "Nuno Faria"
   },
   "metadata": {
-    "description": "Personal plugins for omp and Claude Code: the nu CLI skills and standalone skills.",
+    "description": "Personal plugins for omp and Claude Code.",
     "version": "1.0.0"
   },
   "plugins": [
@@ -12,15 +12,6 @@
       "name": "nu",
       "source": "./cli",
       "description": "Skills and commands that drive the nu CLI: branch/MR review, stacked rebase, worktrees.",
-      "version": "1.0.0",
-      "author": {
-        "name": "Nuno Faria"
-      }
-    },
-    {
-      "name": "skills",
-      "source": "./skills",
-      "description": "Standalone skills: gcx, simple-english, find-skills.",
       "version": "1.0.0",
       "author": {
         "name": "Nuno Faria"

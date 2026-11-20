@@ -5,9 +5,11 @@ Everything personal that a coding agent or terminal picks up, in one repo:
 | directory | what | consumed by |
 |---|---|---|
 | [`cli/`](cli/) | the `nu` CLI (`wt`, `rb`, `rv`) and the skills and commands that drive it | shell, omp, Claude Code |
-| [`skills/`](skills/) | standalone skills: `gcx`, `simple-english`, `find-skills` | omp, Claude Code |
 | [`herdr-app/`](herdr-app/) | Herdr desktop app: the `worktrees` dialog mod, split scripts for diff and `nu rv` | Herdr app |
-| `marketplace.json` | catalog of the `nu` and `skills` plugins | `omp plugin`, `claude plugin` |
+| `marketplace.json` | catalog of the `nu` plugin | `omp plugin`, `claude plugin` |
+
+Third-party skills (`find-skills`, `simple-english`, `gcx`) are not here: `npx skills` manages
+them in `~/.agents`, next to the links this repo installs.
 
 ## This machine
 
@@ -24,10 +26,10 @@ symlink, so edits are live; re-run after moving the repo or adding a skill, comm
 
 ```sh
 omp plugin marketplace add git@github.com:nunofaria11/nuno-plugins.git
-omp plugin install nu@nuno-plugins skills@nuno-plugins
+omp plugin install nu@nuno-plugins
 claude plugin marketplace add nunofaria11/nuno-plugins
 claude plugin install nu@nuno-plugins
-herdr plugin install nunofaria11/nuno-plugins/herdr
+git clone https://github.com/nunofaria11/nuno-plugins ~/code/personal/nuno-plugins && ~/code/personal/nuno-plugins/install.sh
 ```
 
 The `nu` plugin's skills shell out to `nu`, so the CLI still needs `install.sh` (or a clone on
