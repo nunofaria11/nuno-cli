@@ -1,40 +1,26 @@
 # nuno-plugins
 
-Everything personal that a coding agent or terminal picks up, in one repo:
+Personal tooling that a shell, a coding agent or the Herdr app picks up:
 
 | directory | what | consumed by |
 |---|---|---|
 | [`cli/`](cli/) | the `nu` CLI (`wt`, `rb`, `rv`) and the skills and commands that drive it | shell, omp, Claude Code |
 | [`herdr-app/`](herdr-app/) | Herdr desktop app: the `worktrees` dialog mod, split scripts for diff and `nu rv` | Herdr app |
-| `marketplace.json` | catalog of the `nu` plugin | `omp plugin`, `claude plugin` |
 
 Third-party skills (`find-skills`, `simple-english`, `gcx`) are not here: `npx skills` manages
 them in `~/.agents`, next to the links this repo installs.
 
-## This machine
+## Install
 
 ```sh
-./install.sh
+git clone https://github.com/nunofaria11/nuno-plugins ~/code/personal/nuno-plugins
+~/code/personal/nuno-plugins/install.sh
 ```
 
-Symlinks `cli/bin/nu` into `~/.local/bin`, every plugin's skills and commands into
-`~/.agents/` (omp and Claude Code both read from there), `herdr-app/mods/*` into
-`~/.config/herdr-app/mods/`, and wires `cli/shell/nu.zsh` into `~/.zshrc`. Everything is a
-symlink, so edits are live; re-run after moving the repo or adding a skill, command or mod.
-
-## Another machine
-
-```sh
-omp plugin marketplace add git@github.com:nunofaria11/nuno-plugins.git
-omp plugin install nu@nuno-plugins
-claude plugin marketplace add nunofaria11/nuno-plugins
-claude plugin install nu@nuno-plugins
-git clone https://github.com/nunofaria11/nuno-plugins ~/code/personal/nuno-plugins && ~/code/personal/nuno-plugins/install.sh
-```
-
-The `nu` plugin's skills shell out to `nu`, so the CLI still needs `install.sh` (or a clone on
-`PATH`). Do not install the marketplace plugins on a machine that also ran `install.sh`: the
-skills would be registered twice.
+Symlinks `cli/bin/nu` into `~/.local/bin`, the nu skills and commands into `~/.agents/` (omp
+and Claude Code both read from there), `herdr-app/mods/*` into `~/.config/herdr-app/mods/`,
+and wires `cli/shell/nu.zsh` into `~/.zshrc`. Everything is a symlink, so edits are live;
+re-run after moving the repo or adding a skill, command or mod.
 
 ## Herdr desktop app
 

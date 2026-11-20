@@ -19,8 +19,8 @@ the thing and working on it.
 ../install.sh
 ```
 
-The installer lives at the repo root and covers every plugin. For this one it symlinks
-`bin/nu` into `~/.local/bin`, links every skill in `skills/` and command in `commands/`
+The installer lives at the repo root and also covers the Herdr app mods. For this directory it
+symlinks `bin/nu` into `~/.local/bin`, links every skill in `skills/` and command in `commands/`
 into `~/.agents/` (`NU_AGENTS_DIR` overrides it), and appends one line to `~/.zshrc` which
 sources `shell/nu.zsh`. Use `../install.sh --no-shell` to skip the last part and wire it up
 yourself. `NU_BINDIR` overrides the link target.
@@ -62,7 +62,6 @@ command worth explaining gets a `docs/<command>/` directory.
 ## Layout
 
 ```
-.claude-plugin/         plugin manifest; this directory is the `nu` plugin of the marketplace
 bin/nu                  dispatcher
 libexec/nu-<command>    one file per command; `# summary:` shows up in `nu help`
 lib/common.sh           colours, prompts, cd requests, repo resolution

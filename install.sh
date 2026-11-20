@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Symlinks cli/bin/nu into ~/.local/bin, every skill and command of every plugin into
-# ~/.agents, links the Herdr plugin, and wires the zsh wrapper into ~/.zshrc.
+# Symlinks cli/bin/nu into ~/.local/bin, the nu skills and commands into ~/.agents,
+# the Herdr app mods into its mods folder, and wires the zsh wrapper into ~/.zshrc.
 set -euo pipefail
 
 root=$(cd -P "$(dirname "$0")" && pwd)
@@ -22,7 +22,7 @@ case ":$PATH:" in
   *) echo "warning: $bindir is not on your PATH" >&2 ;;
 esac
 
-# Skills and commands live next to the code they describe, inside each plugin;
+# The skills and commands live next to the nu commands they drive;
 # ~/.agents is where Claude Code and omp discover them on this machine.
 link_agent() {
   local src=$1 dest="$2/$(basename "$1")"
@@ -35,14 +35,11 @@ link_agent() {
   echo "linked $dest -> $src"
 }
 
-for plugin in "$root"/*/.claude-plugin; do
-  plugin=$(dirname "$plugin")
-  for src in "$plugin"/skills/*/; do
-    if [ -d "$src" ]; then link_agent "${src%/}" "$agents/skills"; fi
-  done
-  for src in "$plugin"/commands/*.md; do
-    if [ -f "$src" ]; then link_agent "$src" "$agents/commands"; fi
-  done
+for src in "$root"/cli/skills/*/; do
+  if [ -d "$src" ]; then link_agent "${src%/}" "$agents/skills"; fi
+done
+for src in "$root"/cli/commands/*.md; do
+  if [ -f "$src" ]; then link_agent "$src" "$agents/commands"; fi
 done
 
 # The Herdr desktop app hot-reloads mods/ ; the link keeps edits live.
