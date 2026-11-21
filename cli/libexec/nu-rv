@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# summary: review a branch or merge request: worktree, reading order, review page
+# summary: review a branch or merge request: worktree, reading order, review check
 set -euo pipefail
 . "${NU_LIB:?nu-rv must be run through the nu dispatcher}/common.sh"
 
@@ -8,7 +8,7 @@ ENGINE="$NU_LIB/review.py"
 usage() {
   cat <<'USAGE'
 usage: nu rv [prep] [target] [options]
-       nu rv render <review.json> [--no-open]
+       nu rv check <review.json>
 
 prep (the default) gets a change ready to review. The target is one of:
   (nothing)          the current branch, reviewed in place
@@ -29,9 +29,10 @@ the shell wrapper, it cds into the worktree.
   --no-fetch         use what is already fetched
   --no-cd            stay where you are
 
-render checks the review.json an agent wrote against the captured diff, writes
-review.html next to it and opens it. Exit 2 means review.json is invalid; the
-errors say what to fix.
+check validates the review.json an agent wrote against the captured diff and
+writes bundle.json next to it: the review plus finding codes, diff excerpts,
+fix prompts and IDE links. The agent presents the bundle the way its harness
+does best. Exit 2 means review.json is invalid; the errors say what to fix.
 USAGE
 }
 
@@ -40,7 +41,7 @@ command -v python3 >/dev/null || die "python3 not found"
 
 case "${1:-}" in
   -h | --help | help) usage; exit 0 ;;
-  render) shift; exec python3 "$ENGINE" render "$@" ;;
+  check) shift; exec python3 "$ENGINE" check "$@" ;;
   prep) shift ;;
 esac
 exec python3 "$ENGINE" prep "$@"

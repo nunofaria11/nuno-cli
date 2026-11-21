@@ -124,34 +124,42 @@ class ReviewTest(unittest.TestCase):
         review.update(overrides)
         return review
 
-    def render(self, review: dict) -> subprocess.CompletedProcess:
+    def check(self, review: dict) -> subprocess.CompletedProcess:
         path = Path(self.prep()["paths"]["review_json"])
         path.write_text(json.dumps(review))
-        return self.nu("render", str(path), "--no-open")
+        return self.nu("check", str(path))
 
-    def test_render_anchors_a_finding_under_its_line(self) -> None:
-        p = self.render(self.review())
+    def test_check_writes_a_bundle_with_codes_excerpts_and_fix_prompts(self) -> None:
+        review = self.review(clean=["`main` still returns an int."])
+
+        p = self.check(review)
 
         self.assertEqual(p.returncode, 0, p.stderr)
-        page = Path(p.stdout.strip()).read_text()
-        row = page.index('data-l="6">6</td>')
-        card = page.index('id="H1"')
-        self.assertLess(row, card, "the finding card must follow the line it is about")
-        self.assertIn('data-copy="issue (blocking):', page)
-        self.assertIn("Fix review finding H1 in the worktree", page)
+        bundle = json.loads(Path(p.stdout.strip()).read_text())
+        finding = bundle["findings"][0]
+        self.assertEqual(finding["code"], "H1")
+        self.assertEqual(finding["placement"], "diff")
+        hits = [r for r in finding["excerpt"]["rows"] if r["hit"]]
+        self.assertEqual([(r["new"], r["text"]) for r in hits], [(6, "    return 2")])
+        self.assertTrue(finding["fix_prompt"].startswith("Fix review finding H1 in the worktree"))
+        self.assertEqual(bundle["counts"], {"critical": 0, "high": 1, "medium": 0, "low": 0})
+        self.assertEqual(bundle["clean"], ["`main` still returns an int."])
         # The lockfile was in no step, so it lands in the catch-all step instead of failing.
-        self.assertIn("Generated files, lockfiles, translations and changelog", page)
+        last = bundle["steps"][-1]
+        self.assertTrue(last["noise"])
+        self.assertEqual([f["path"] for f in last["files"]], ["package-lock.json"])
+        self.assertEqual(bundle["steps"][0]["files"][0]["findings"], ["H1"])
 
-    def test_render_rejects_a_review_that_skips_a_changed_file(self) -> None:
+    def test_check_rejects_a_review_that_skips_a_changed_file(self) -> None:
         review = self.review(steps=[{"title": "Entry", "explanation": "x", "files": ["src/app.py"]}])
         review["findings"][0]["comment"] = "Please fix this."
 
-        p = self.render(review)
+        p = self.check(review)
 
         self.assertEqual(p.returncode, 2)
         self.assertIn("'tests/test_app.py' is not in any step", p.stderr)
         self.assertIn("Conventional Comments label", p.stderr)
-
+        self.assertFalse((Path(p.stderr.split(" is invalid")[0]).parent / "bundle.json").exists())
 
 if __name__ == "__main__":
     unittest.main()

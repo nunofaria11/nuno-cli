@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""review: prepare a branch or merge request for review, and render the review page.
+"""review: prepare a branch or merge request for review, and check the review an agent wrote.
 
 prep    Resolve the target (current branch, branch name, GitLab MR, GitHub PR), fetch
         it, check it out in a worktree next to the repository, and write meta.json and
         diff.patch to the review directory. Prints the size, the simple/complex
         verdict and a first reading order.
-render  Validate the review.json an agent wrote against the captured patch, then
-        write one self-contained review.html next to it.
+check   Validate the review.json an agent wrote against the captured patch, then
+        write bundle.json next to it: the review plus what a presenter derives from
+        it (finding codes, diff excerpts, fix prompts, IDE links, counts). How the
+        review is shown is up to the agent and its harness.
 
 The diff is always taken against the merge request's target branch when there is
 one, so a stacked merge request shows only its own change.
@@ -21,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import html
 import json
 import os
 import re
@@ -32,12 +33,11 @@ from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote
 
-# A review is "complex", and gets the HTML page, past any of these.
+# A review is "complex", and is worth a page where the harness can show one, past any of these.
 MAX_FILES = 8
 MAX_LINES = 400
 MAX_AREAS = 1
 
-COLLAPSE_LINES = 800
 
 TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -545,7 +545,7 @@ def prep(args: argparse.Namespace) -> int:
 
     out_dir = review_dir(main.name, branch)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for stale in ("review.json", "review.html"):
+    for stale in ("review.json", "bundle.json", "page.html", "review.html"):
         (out_dir / stale).unlink(missing_ok=True)
     patch = git(main, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M",
                 "--src-prefix=a/", "--dst-prefix=b/", merge_base, head_sha)
@@ -580,7 +580,8 @@ def prep(args: argparse.Namespace) -> int:
             "meta": str(out_dir / "meta.json"),
             "patch": str(out_dir / "diff.patch"),
             "review_json": str(out_dir / "review.json"),
-            "html": str(out_dir / "review.html"),
+            "bundle": str(out_dir / "bundle.json"),
+            "page": str(out_dir / "page.html"),
         },
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
@@ -685,7 +686,7 @@ def parse_patch(text: str) -> dict[str, dict]:
     return {(f["old_path"] if f.get("deleted") else f["path"]): f for f in files}
 
 
-# --------------------------------------------------------------------------- render: validation
+# --------------------------------------------------------------------------- check: validation
 
 
 SEVERITIES = ("critical", "high", "medium", "low")
@@ -714,6 +715,11 @@ def validate(review: dict, meta: dict, diffs: dict[str, dict]) -> list[str]:
     else:
         text(verdict, "text", "verdict")
     text(review, "summary", "review")
+
+    clean = review.get("clean")
+    if clean is not None and (not isinstance(clean, list)
+                              or not all(isinstance(c, str) and c.strip() for c in clean)):
+        errors.append("clean: list of non-empty strings")
 
     intent = review.get("intent")
     if intent is not None:
@@ -790,30 +796,10 @@ def validate(review: dict, meta: dict, diffs: dict[str, dict]) -> list[str]:
     return errors
 
 
-# --------------------------------------------------------------------------- render: html
+# --------------------------------------------------------------------------- check: bundle
 
 
-def esc(s: str) -> str:
-    return html.escape(s, quote=True)
-
-
-def inline(s: str) -> str:
-    parts = s.split("`")
-    if len(parts) % 2 == 0:
-        return esc(s)
-    return "".join(esc(p) if i % 2 == 0 else f"<code>{esc(p)}</code>" for i, p in enumerate(parts))
-
-
-def prose(s: str) -> str:
-    out = []
-    for block in re.split(r"\n\s*\n", s.strip()):
-        lines = [l for l in block.split("\n") if l.strip()]
-        if lines and all(l.lstrip().startswith(("- ", "* ")) for l in lines):
-            items = "".join(f"<li>{inline(l.lstrip()[2:])}</li>" for l in lines)
-            out.append(f"<ul>{items}</ul>")
-        else:
-            out.append(f"<p>{inline(' '.join(l.strip() for l in lines))}</p>")
-    return "".join(out)
+EXCERPT_CONTEXT = 3
 
 
 JVM = {".kt", ".kts", ".java", ".gradle", ".groovy", ".scala"}
@@ -874,81 +860,35 @@ def fix_prompt(code: str, f: dict, meta: dict, review_path: Path) -> str:
     return "\n".join(lines)
 
 
-def finding_card(code: str, f: dict, ide: str | None, prompt: str) -> str:
-    sev = f["severity"]
-    rows = [("Where", f["where"]), ("Why", f["why"])] + ([("Fix", f["fix"])] if f.get("fix") else [])
-    dl = "".join(f"<dt>{k}</dt><dd>{inline(v)}</dd>" for k, v in rows)
-    open_link = (f' <a class="btn" href="{esc(ide + str(f.get("line", 1)))}">Open in IDE</a>' if ide else "")
-    return (
-        f'<article class="finding sev-{sev}" id="{code}" tabindex="-1">'
-        f'<header><a class="code-id" href="#{code}">{code}</a><span class="pill {sev}">{sev.title()}</span>'
-        f'<span class="section">{SECTIONS[f["section"]]}</span>'
-        f'<h4>{inline(f["title"])}</h4></header>'
-        f'<div class="prose">{prose(f["body"])}</div><dl>{dl}</dl>'
-        f'<div class="cc"><pre>{esc(f["comment"])}</pre>'
-        f'<div class="actions"><button class="btn copy" type="button" data-copy="{esc(f["comment"])}">'
-        f'Copy comment</button><button class="btn copy" type="button" data-copy="{esc(prompt)}">'
-        f'Fix locally</button>{open_link}</div></div></article>'
-    )
+def on_side(kind: str, side: str) -> bool:
+    return kind != "del" if side == "new" else kind != "add"
 
 
-def anchor_of(f: dict, diff: dict | None) -> tuple[str, int] | None:
-    """(side, line) of the diff row the card goes under, when that line is displayed."""
+def excerpt(f: dict, diff: dict | None) -> dict | None:
+    """The diff rows of a finding's lines plus some context, when the diff displays its last line."""
     if diff is None or "line" not in f:
         return None
     side = f.get("side", "new")
-    last = f.get("end_line", f["line"])
+    first, last = f["line"], f.get("end_line", f["line"])
     for h in diff["hunks"]:
-        for kind, o, n, _ in h["lines"]:
-            if (n if side == "new" else o) == last and (kind != "del" if side == "new" else kind != "add"):
-                return side, last
+        rows = h["lines"]
+        number = [(n if side == "new" else o) if on_side(kind, side) else None for kind, o, n, _ in rows]
+        if last not in number:
+            continue
+        hits = {i for i, x in enumerate(number) if x is not None and first <= x <= last}
+        lo = max(0, min(hits) - EXCERPT_CONTEXT)
+        hi = min(len(rows), max(hits) + EXCERPT_CONTEXT + 1)
+        return {
+            "side": side,
+            "hunk": h["header"],
+            "rows": [{"kind": kind, "old": o, "new": n, "text": text, "hit": i in hits}
+                     for i, (kind, o, n, text) in enumerate(rows[lo:hi], start=lo)],
+        }
     return None
 
 
-def file_section(path: str, meta_file: dict, diff: dict, cards: dict, unanchored: list[str],
-                 ide: str | None, highlight: dict) -> str:
-    status = {"A": "added", "D": "deleted", "R": "renamed", "C": "copied"}.get(meta_file["status"], "modified")
-    name = f"{esc(meta_file['old_path'])} → {esc(path)}" if meta_file.get("old_path") else esc(path)
-    churn = "binary" if meta_file["binary"] else f'<span class="a">+{meta_file["added"]}</span> ' \
-                                                  f'<span class="d">−{meta_file["deleted"]}</span>'
-    size = sum(len(h["lines"]) for h in diff["hunks"])
-    is_open = "" if meta_file["noise"] or size > COLLAPSE_LINES else " open"
-    rows = []
-    for h in diff["hunks"]:
-        rows.append(f'<tr class="hunk"><td colspan="3">{esc(h["header"])}</td></tr>')
-        for kind, o, n, content in h["lines"]:
-            if kind == "note":
-                rows.append(f'<tr class="note"><td></td><td></td><td>{esc(content)}</td></tr>')
-                continue
-            hl = " hl" if (o is not None and o in highlight.get("old", ())) or \
-                          (n is not None and n in highlight.get("new", ())) else ""
-            sign = {"add": "+", "del": "-", "ctx": " "}[kind]
-            new_cell = f'<td class="ln new" data-l="{n}">{n}</td>' if n is not None else '<td class="ln"></td>'
-            rows.append(f'<tr class="{kind}{hl}"><td class="ln">{o if o is not None else ""}</td>'
-                        f'{new_cell}<td class="code">{sign}{esc(content)}</td></tr>')
-            keys = ([("new", n)] if n is not None else []) + ([("old", o)] if o is not None and kind != "add" else [])
-            for key in keys:
-                for card in cards.pop(key, []):
-                    rows.append(f'<tr class="anchor"><td colspan="3">{card}</td></tr>')
-    if diff["binary"] and not diff["hunks"]:
-        rows.append('<tr class="note"><td></td><td></td><td>Binary file; not shown.</td></tr>')
-    data_ide = f' data-ide="{esc(ide)}"' if ide else ""
-    open_link = f'<a class="btn small" href="{esc(ide)}1">Open in IDE</a>' if ide else ""
-    return (
-        f'<section class="file" id="{esc(file_id(path))}"{data_ide}><details{is_open}><summary>'
-        f'<span class="status {status}">{status}</span><span class="path">{name}</span>'
-        f'<span class="churn">{churn}</span>{open_link}</summary>'
-        + "".join(unanchored)
-        + f'<table class="diff"><colgroup><col class="ln"><col class="ln"><col></colgroup>'
-          f'<tbody>{"".join(rows)}</tbody></table></details></section>'
-    )
-
-
-def file_id(path: str) -> str:
-    return "file-" + re.sub(r"[^A-Za-z0-9_-]", "-", path)
-
-
-def render_html(review: dict, meta: dict, diffs: dict[str, dict], review_path: Path) -> tuple[str, list[str]]:
+def build_bundle(review: dict, meta: dict, diffs: dict[str, dict], review_path: Path) -> tuple[dict, list[str]]:
+    """Everything a presenter needs, derived once: codes, excerpts, fix prompts, IDE links, counts."""
     worktree = Path(meta["worktree"])
     files_meta = {f["path"]: f for f in meta["files"]}
     findings = review["findings"]
@@ -962,219 +902,90 @@ def render_html(review: dict, meta: dict, diffs: dict[str, dict], review_path: P
             ide_cache[path] = None if gone else ide_prefix(worktree, path)
         return ide_cache[path]
 
+    codes = finding_codes(findings)
+    out_findings = []
+    for i, f in enumerate(findings):
+        path = f.get("file")
+        diff = diffs.get(path) if path else None
+        ex = excerpt(f, diff)
+        placement = "diff" if ex else "file" if diff is not None else "outside"
+        if placement == "file" and "line" in f:
+            notes.append(f"finding {codes[i]} ({path}, line {f['line']}) is not on a line the diff shows")
+        prefix = ide(path) if path else None
+        out_findings.append({
+            "code": codes[i],
+            **f,
+            "side": f.get("side", "new") if "line" in f else None,
+            "placement": placement,
+            "excerpt": ex,
+            "ide_url": prefix + str(f.get("line", 1)) if prefix else None,
+            "fix_prompt": fix_prompt(codes[i], f, meta, review_path),
+        })
+
     steps = [dict(s) for s in review["steps"]]
     covered = {p for s in steps for p in s["files"]}
     rest = [p for p in diffs if p not in covered]
     if rest:
         steps.append({"title": "Generated files, lockfiles, translations and changelog",
                       "explanation": "Listed for completeness. Nothing here was written by hand.",
-                      "files": rest})
-    step_of = {p: i for i, s in enumerate(steps) for p in s["files"]}
+                      "files": rest, "noise": True})
+    by_file: dict[str, list[str]] = {}
+    for f in out_findings:
+        if f.get("file"):
+            by_file.setdefault(f["file"], []).append(f["code"])
+    out_steps = []
+    for s in steps:
+        files = []
+        for path in s["files"]:
+            m = files_meta[path]
+            prefix = ide(path)
+            files.append({
+                "path": path,
+                "old_path": m.get("old_path"),
+                "status": m["status"],
+                "kind": m["kind"],
+                "noise": m["noise"],
+                "added": m["added"],
+                "deleted": m["deleted"],
+                "binary": m["binary"],
+                "ide_url": prefix + "1" if prefix else None,
+                "findings": by_file.get(path, []),
+            })
+        out_steps.append({
+            "title": s["title"],
+            "explanation": s["explanation"],
+            "diagram": s.get("diagram"),
+            "noise": bool(s.get("noise")),
+            "files": files,
+        })
 
-    order = sorted(range(len(findings)), key=lambda i: SEVERITIES.index(findings[i]["severity"]))
-    codes = finding_codes(findings)
-
-    anchored: dict[str, dict] = {}
-    above_file: dict[str, list[str]] = {}
-    general: list[str] = []
-    highlight: dict[str, dict] = {}
-    for i, f in enumerate(findings):
-        path = f.get("file")
-        card = finding_card(codes[i], f, ide(path) if path else None, fix_prompt(codes[i], f, meta, review_path))
-        diff = diffs.get(path) if path else None
-        anchor = anchor_of(f, diff)
-        if anchor:
-            anchored.setdefault(path, {}).setdefault(anchor, []).append(card)
-            side, last = anchor
-            highlight.setdefault(path, {}).setdefault(side, set()).update(range(f["line"], last + 1))
-        elif diff is not None:
-            above_file.setdefault(path, []).append(card)
-            if "line" in f:
-                notes.append(f"finding {codes[i]} ({path}, line {f['line']}) is not on a displayed "
-                             "line; shown above the file")
-        else:
-            general.append(card)
-
-    mr = meta["mr"]
-    s = meta["stats"]
-    title = mr["title"] if mr else meta["branch"]
-    decision = review["verdict"]["decision"]
-    counts = {sev: sum(1 for f in findings if f["severity"] == sev) for sev in SEVERITIES}
-
-    header_bits = []
-    if mr:
-        header_bits.append(f'<a href="{esc(mr["url"])}">{esc(mr["ref"])}</a>')
-        if mr.get("author"):
-            header_bits.append(f"by {esc(mr['author'])}")
-        if mr.get("draft"):
-            header_bits.append("draft")
-    header_bits.append(f"<code>{esc(meta['branch'])}</code> → <code>{esc(meta['base']['ref'])}</code>")
-    header_bits.append(f"<code>{meta['base']['merge_base'][:9]}..{meta['head']['sha'][:9]}</code>")
-    header_bits.append(f"{len(meta['commits'])} commit(s), {s['files']} files, "
-                       f'<span class="a">+{s["added"]}</span> <span class="d">−{s["deleted"]}</span>')
-
-    parts = [
-        f'<header class="top" id="overview"><h1>{inline(title)}</h1>'
-        f'<p class="meta">{" · ".join(header_bits)}</p></header>',
-        f'<div class="verdict {decision}"><strong>{DECISIONS[decision]}.</strong> '
-        f'{inline(review["verdict"]["text"])}</div>',
-    ]
-    for note in meta.get("notes", []):
-        parts.append(f'<div class="warn">{inline(note)}</div>')
-    parts.append(f'<section class="summary"><h2>What changed</h2>{prose(review["summary"])}</section>')
-
-    intent = review.get("intent")
-    if intent and intent["criteria"]:
-        label = intent.get("ticket") or (meta.get("ticket") or "Ticket")
-        link = f'<a href="{esc(intent["url"])}">{esc(label)}</a>' if intent.get("url") else esc(label)
-        rows = "".join(
-            f'<tr><td>{inline(c["text"])}</td><td><span class="crit {c["status"]}">{c["status"]}</span></td>'
-            f'<td>{inline(c.get("note") or "")}</td></tr>' for c in intent["criteria"])
-        parts.append(f'<section class="intent"><h2>Acceptance criteria · {link}</h2>'
-                     f'<table><thead><tr><th>Criterion</th><th>Status</th><th>Note</th></tr></thead>'
-                     f'<tbody>{rows}</tbody></table></section>')
-
-    chips = " ".join(f'<span class="pill {sev}">{counts[sev]} {sev}</span>' for sev in SEVERITIES if counts[sev])
-    if findings:
-        items = "".join(
-            f'<li><a href="#{codes[i]}"><span class="code-id">{codes[i]}</span> '
-            f'<span class="pill {findings[i]["severity"]}">'
-            f'{findings[i]["severity"].title()}</span> {inline(findings[i]["title"])}</a>'
-            f'<span class="loc">{inline(findings[i]["where"])}</span></li>' for i in order)
-        parts.append(f'<section class="attention" id="findings"><h2>Needs your attention {chips}</h2>'
-                     f'<ol>{items}</ol><p class="hint">j / k jump between findings in the code.</p></section>')
-    else:
-        parts.append('<section class="attention" id="findings"><h2>Needs your attention</h2>'
-                     '<p>None found.</p></section>')
-    if general:
-        parts.append(f'<section class="general"><h2>Findings outside the diff</h2>{"".join(general)}</section>')
-
-    rail = ['<a href="#overview">Overview</a>', f'<a href="#findings">Findings ({len(findings)})</a>']
-    for i, step in enumerate(steps):
-        n_find = sum(1 for f in findings if step_of.get(f.get("file", "")) == i)
-        badge = f' <span class="count">{n_find}</span>' if n_find else ""
-        sub = "".join(f'<li><a href="#{esc(file_id(p))}" title="{esc(p)}">{esc(Path(p).name)}</a></li>'
-                      for p in step["files"])
-        rail.append(f'<a href="#step-{i + 1}">{i + 1}. {inline(step["title"])}{badge}</a><ul>{sub}</ul>')
-        body = [f'<section class="step" id="step-{i + 1}"><h2>{i + 1}. {inline(step["title"])}</h2>'
-                f'<div class="prose">{prose(step["explanation"])}</div>']
-        if step.get("diagram"):
-            body.append(f'<pre class="mermaid">{esc(step["diagram"])}</pre>')
-        for path in step["files"]:
-            cards = anchored.get(path, {})
-            body.append(file_section(path, files_meta[path], diffs[path], cards, above_file.get(path, []),
-                                     ide(path), highlight.get(path, {})))
-        body.append("</section>")
-        parts.append("".join(body))
-
-    mermaid = ""
-    if any(st.get("diagram") for st in steps):
-        mermaid = ("<script type=\"module\">import mermaid from "
-                   "'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';"
-                   "mermaid.initialize({startOnLoad:true,theme:matchMedia('(prefers-color-scheme: dark)')"
-                   ".matches?'dark':'default'});</script>")
-
-    page = (
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"<title>Review: {esc(title)}</title><style>{CSS}</style></head><body>"
-        f'<nav class="rail">{"".join(rail)}</nav><main>{"".join(parts)}'
-        f'<footer>Generated {esc(time.strftime("%Y-%m-%d %H:%M"))} by nu rv from '
-        f'<code>{esc(tilde(meta["worktree"]))}</code></footer></main>'
-        f"<script>{JS}</script>{mermaid}</body></html>"
-    )
-    return page, notes
+    bundle = {
+        "version": 1,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "repo": meta["repo"],
+        "worktree": meta["worktree"],
+        "branch": meta["branch"],
+        "ticket": meta.get("ticket"),
+        "mr": meta["mr"],
+        "base": meta["base"],
+        "head": meta["head"],
+        "commits": len(meta["commits"]),
+        "stats": meta["stats"],
+        "complexity": meta["complexity"],
+        "notes": meta.get("notes", []),
+        "verdict": review["verdict"],
+        "summary": review["summary"],
+        "intent": review.get("intent"),
+        "clean": review.get("clean", []),
+        "counts": {sev: sum(1 for f in findings if f["severity"] == sev) for sev in SEVERITIES},
+        "findings": out_findings,
+        "steps": out_steps,
+        "paths": {**meta["paths"], "review_json": str(review_path)},
+    }
+    return bundle, notes
 
 
-CSS = """
-:root{--bg:#fff;--fg:#1f2328;--muted:#656d76;--border:#d0d7de;--surface:#f6f8fa;--accent:#0969da;
---add:#dafbe1;--del:#ffebe9;--hl:#fff8c5;--crit:#cf222e;--high:#bc4c00;--med:#9a6700;--low:#656d76;
---ok:#1a7f37}
-@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--border:#30363d;
---surface:#161b22;--accent:#4493f8;--add:#12261e;--del:#25171c;--hl:#3b2f0b;--crit:#ff7b72;--high:#ffa657;
---med:#d29922;--low:#8d96a0;--ok:#3fb950}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,
-"Segoe UI",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
-display:grid;grid-template-columns:300px minmax(0,1fr)}
-code,pre,.diff{font-family:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;font-size:14px}
-code{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:0 4px}
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
-.rail{position:sticky;top:0;height:100vh;overflow:auto;padding:16px;border-right:1px solid var(--border);
-background:var(--surface);font-size:14.5px}
-.rail>a{display:block;font-weight:600;margin:10px 0 4px;color:var(--fg)}
-.rail ul{list-style:none;margin:0;padding-left:12px}.rail li a{color:var(--muted);display:block;
-overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.count{background:var(--high);color:var(--bg);border-radius:9px;padding:0 6px;font-size:12px}
-main{padding:24px 32px;max-width:1280px}
-h1{font-size:26px;margin:0 0 4px}h2{font-size:20px;margin:28px 0 8px}h4{margin:0;font-size:16px}
-.meta,.loc,.hint,footer{color:var(--muted)}footer{margin:40px 0 8px;font-size:13px}
-.verdict{border-left:4px solid;padding:10px 14px;margin:16px 0;background:var(--surface);border-radius:4px}
-.verdict.merge{border-color:var(--ok)}.verdict.fix{border-color:var(--med)}.verdict.block{border-color:var(--crit)}
-.warn{border-left:4px solid var(--med);padding:6px 12px;margin:8px 0;background:var(--surface)}
-.code-id{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-weight:700;color:var(--fg)}
-.pill{display:inline-block;border-radius:10px;padding:0 8px;font-size:12.5px;font-weight:600;color:var(--bg)}
-.pill.critical{background:var(--crit)}.pill.high{background:var(--high)}.pill.medium{background:var(--med)}
-.pill.low{background:var(--low)}
-.attention ol{padding-left:22px}.attention li{margin:4px 0}.attention .loc{margin-left:8px;font-size:14px}
-table{border-collapse:collapse}.intent table{width:100%}.intent td,.intent th{border:1px solid var(--border);
-padding:6px 8px;text-align:left;vertical-align:top}
-.crit{font-weight:600}.crit.met{color:var(--ok)}.crit.partial{color:var(--med)}.crit.missing{color:var(--crit)}
-.crit.unclear{color:var(--muted)}
-.step{border-top:1px solid var(--border);margin-top:28px}
-.file{border:1px solid var(--border);border-radius:6px;margin:12px 0;overflow:hidden}
-.file summary{display:flex;gap:10px;align-items:center;padding:8px 12px;background:var(--surface);
-cursor:pointer;position:sticky;top:0;z-index:1}
-.file .path{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:14px;flex:1;overflow-wrap:anywhere}
-.status{font-size:12px;text-transform:uppercase;color:var(--muted);min-width:64px}
-.a{color:var(--ok)}.d{color:var(--crit)}
-.btn{border:1px solid var(--border);background:var(--bg);color:var(--fg);border-radius:6px;padding:3px 10px;
-font-size:13px;cursor:pointer}.btn.small{padding:1px 8px}
-.diff{width:100%;table-layout:fixed}
-.diff td{padding:0 8px;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}
-.diff col.ln{width:56px}.diff td.ln{text-align:right;color:var(--muted);user-select:none}
-.diff td.ln.new{cursor:pointer}.diff td.ln.new:hover{color:var(--accent);text-decoration:underline}
-.diff tr.add td{background:var(--add)}.diff tr.del td{background:var(--del)}
-.diff tr.hl td.code{background:var(--hl)}
-.diff tr.hunk td{background:var(--surface);color:var(--muted);padding:4px 8px}
-.diff tr.anchor td{padding:8px 12px;white-space:normal;font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,
-"Segoe UI",sans-serif}
-.finding{border:1px solid var(--border);border-left:4px solid;border-radius:6px;padding:10px 14px;margin:10px 0;
-background:var(--bg)}
-.finding:focus{outline:2px solid var(--accent)}
-.finding.sev-critical{border-left-color:var(--crit)}.finding.sev-high{border-left-color:var(--high)}
-.finding.sev-medium{border-left-color:var(--med)}.finding.sev-low{border-left-color:var(--low)}
-.finding header{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.finding .section{color:var(--muted);font-size:13px}
-.finding dl{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:8px 0}
-.finding dt{font-weight:600;color:var(--muted)}.finding dd{margin:0}
-.cc pre{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px;
-white-space:pre-wrap;margin:6px 0}
-.actions{display:flex;gap:8px}
-.prose p{margin:6px 0}
-pre.mermaid{background:var(--surface);padding:12px;border-radius:6px}
-@media (max-width:900px){body{grid-template-columns:1fr}.rail{display:none}}
-"""
-
-JS = """
-const copyText=async t=>{try{await navigator.clipboard.writeText(t)}catch{const a=document.createElement('textarea');
-a.value=t;document.body.append(a);a.select();document.execCommand('copy');a.remove()}};
-document.addEventListener('click',e=>{const b=e.target.closest('button.copy');
-if(b){const label=b.dataset.label??=b.textContent;copyText(b.dataset.copy).then(()=>{b.textContent='Copied';setTimeout(()=>b.textContent=label,1500)});return}
-const ln=e.target.closest('td.ln.new[data-l]');if(ln){const f=ln.closest('[data-ide]');if(f)location.href=f.dataset.ide+ln.dataset.l}});
-const reveal=()=>{const el=location.hash&&document.getElementById(location.hash.slice(1));
-if(el){let d=el.closest('details');while(d){d.open=true;d=d.parentElement.closest('details')}el.scrollIntoView({block:'center'})}};
-addEventListener('hashchange',reveal);reveal();
-const cards=[...document.querySelectorAll('main .finding')];let at=-1;
-document.addEventListener('keydown',e=>{if(e.metaKey||e.ctrlKey||e.altKey||e.target.closest('input,textarea'))return;
-if(e.key!=='j'&&e.key!=='k')return;if(!cards.length)return;
-at=e.key==='j'?Math.min(at+1,cards.length-1):Math.max(at-1,0);const c=cards[at];
-let d=c.closest('details');while(d){d.open=true;d=d.parentElement.closest('details')}
-c.scrollIntoView({block:'center'});c.focus({preventScroll:true})});
-"""
-
-
-def render(args: argparse.Namespace) -> int:
+def check(args: argparse.Namespace) -> int:
     review_path = Path(args.review).resolve()
     out_dir = review_path.parent
     meta_path, patch_path = out_dir / "meta.json", out_dir / "diff.patch"
@@ -1198,14 +1009,12 @@ def render(args: argparse.Namespace) -> int:
             print(f"  {e}", file=sys.stderr)
         return 2
 
-    page, notes = render_html(review, meta, diffs, review_path)
-    out = out_dir / "review.html"
-    out.write_text(page)
+    bundle, notes = build_bundle(review, meta, diffs, review_path)
+    out = out_dir / "bundle.json"
+    out.write_text(json.dumps(bundle, indent=2) + "\n")
     for note in notes:
         warn(note)
     print(out)
-    if not args.no_open:
-        attempt(["open" if sys.platform == "darwin" else "xdg-open", str(out)])
     return 0
 
 
@@ -1217,11 +1026,10 @@ def main() -> int:
     p.add_argument("--base")
     p.add_argument("--no-fetch", action="store_true")
     p.add_argument("--no-cd", action="store_true")
-    r = sub.add_parser("render")
-    r.add_argument("review")
-    r.add_argument("--no-open", action="store_true")
+    c = sub.add_parser("check")
+    c.add_argument("review")
     args = parser.parse_args()
-    return prep(args) if args.cmd == "prep" else render(args)
+    return prep(args) if args.cmd == "prep" else check(args)
 
 
 if __name__ == "__main__":
